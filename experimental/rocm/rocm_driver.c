@@ -249,7 +249,7 @@ static iree_status_t iree_hal_rocm_driver_create_device_by_uuid(
     ROCM_RETURN_IF_ERROR(&driver->syms, hipDeviceGetUuid(&query_uuid, device),
                          "hipDeviceGetUuid");
     if (memcmp(&device_uuid->bytes[0], &query_uuid.bytes[0],
-               sizeof(device_uuid)) == 0) {
+               sizeof(&device_uuid)) == 0) {
       found_device = true;
       break;
     }
