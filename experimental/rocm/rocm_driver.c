@@ -30,9 +30,6 @@ typedef struct iree_hal_rocm_driver_t {
 // Pick a fixed lenght size for device names.
 #define IREE_MAX_ROCM_DEVICE_NAME_LENGTH 100
 
-#define HIPDEVICE_TO_DEVICE_ID(device) (iree_hal_device_id_t)((device) + 1)
-#define DEVICE_ID_TO_HIPDEVICE(device_id) (hipDevice_t)((device_id)-1)
-
 static const iree_hal_driver_vtable_t iree_hal_rocm_driver_vtable;
 
 static iree_hal_rocm_driver_t* iree_hal_rocm_driver_cast(

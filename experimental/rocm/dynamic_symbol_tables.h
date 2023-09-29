@@ -4,6 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include "experimental/rocm/rocm_headers.h"
 RC_PFN_DECL(hipCtxCreate, hipCtx_t *, unsigned int, hipDevice_t)
 RC_PFN_DECL(hipCtxDestroy, hipCtx_t)
 RC_PFN_DECL(hipDeviceGet, hipDevice_t *, int)  // No direct, need to modify
@@ -54,3 +55,4 @@ RC_PFN_DECL(hipEventQuery, hipEvent_t)
 RC_PFN_DECL(hipEventRecord, hipEvent_t, hipStream_t)
 RC_PFN_DECL(hipEventSynchronize, hipEvent_t)
 RC_PFN_DECL(hipDeviceGetUuid, hipUUID *, hipDevice_t)
+RC_PFN_DECL(hipMemcpyHtoD, hipDeviceptr_t, void *, size_t)
