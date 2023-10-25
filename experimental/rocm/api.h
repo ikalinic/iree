@@ -25,6 +25,14 @@ typedef struct iree_hal_rocm_driver_options_t {
   // Index of the default ROCM device to use within the list of available
   // devices.
   int default_device_index;
+
+  // The host and device event pool capacity.
+  // The ROCM driver implements semaphore with host and device events. This
+  // parameter controls the size of those pools. Larger values would make
+  // creating semaphore values quicker, though with increased memory
+  // consumption.
+  iree_host_size_t event_pool_capacity;
+
 } iree_hal_rocm_driver_options_t;
 
 IREE_API_EXPORT void iree_hal_rocm_driver_options_initialize(
