@@ -33,8 +33,10 @@ iree_lit_test_suite(
     "nvvm_pipeline_test.mlir"
     "pack_pipeline_test.mlir"
     "pack_shared_memory_alloc.mlir"
-    "reduction_pipeline.mlir"
-    "reduction_pipeline_transform.mlir"
+    "reduction_pipeline_cuda.mlir"
+    "reduction_pipeline_rocm.mlir"
+    "reduction_pipeline_transform_cuda.mlir"
+    "reduction_pipeline_transform_rocm.mlir"
     "rocdl_pipeline_test.mlir"
     "set_transform_strategy_batch_matmul.mlir"
     "set_transform_strategy_convolution.mlir"
@@ -59,6 +61,7 @@ iree_lit_test_suite(
     FileCheck
     iree-opt
   DATA
+    attention_transform_spec.mlir
     transform_dialect_codegen_bufferize_spec.mlir
     transform_dialect_codegen_foreach_to_gpu_spec.mlir
     transform_dialect_codegen_vector_distribution_spec.mlir

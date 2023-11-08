@@ -17,7 +17,9 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #define DEBUG_TYPE "iree-stream-pack-dispatch-operands"
 
@@ -75,6 +77,21 @@ static void convertAndDecomposeToI32s(
   if (auto complexType = dyn_cast<ComplexType>(operand.getType())) {
     auto real = builder.create<complex::ReOp>(loc, operand);
     auto imag = builder.create<complex::ImOp>(loc, operand);
+    convertAndDecomposeToI32s(loc, real, newOperands, resourceConfig, builder);
+    convertAndDecomposeToI32s(loc, imag, newOperands, resourceConfig, builder);
+    return;
+  }
+
+  // If the value complex from a complex::BitcastOp we should grab the
+  // real / complex values instead.
+  if (auto bitcast =
+          dyn_cast_or_null<complex::BitcastOp>(operand.getDefiningOp())) {
+    auto complexOperand = bitcast.getOperand();
+    auto complexTy = cast<ComplexType>(complexOperand.getType());
+    auto real = builder.createOrFold<complex::ReOp>(
+        loc, complexTy.getElementType(), complexOperand);
+    auto imag = builder.createOrFold<complex::ImOp>(
+        loc, complexTy.getElementType(), complexOperand);
     convertAndDecomposeToI32s(loc, real, newOperands, resourceConfig, builder);
     convertAndDecomposeToI32s(loc, imag, newOperands, resourceConfig, builder);
     return;
@@ -298,8 +315,10 @@ public:
     // Convert all public function signatures and manipulate the arguments.
     for (auto executableOp :
          getOperation().getOps<IREE::Stream::ExecutableOp>()) {
-      for (auto funcOp :
-           executableOp.getInnerModule().getOps<mlir::func::FuncOp>()) {
+      auto innerModuleOp = executableOp.getInnerModule();
+      if (!innerModuleOp)
+        continue;
+      for (auto funcOp : innerModuleOp.getOps<mlir::func::FuncOp>()) {
         if (funcOp.isPublic()) {
           updateExportFuncOp(funcOp);
         }

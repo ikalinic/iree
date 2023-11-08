@@ -52,10 +52,6 @@ class DeviceCollection(object):
 
 
 ALL_DEVICE_SPECS = [
-    # Pixel 4
-    pixel_4_specs.LITTLE_CORES,
-    pixel_4_specs.BIG_CORES,
-    pixel_4_specs.ALL_CORES,
     # Pixel 6 Pro
     pixel_6_pro_specs.LITTLE_CORES,
     pixel_6_pro_specs.BIG_CORES,
@@ -65,6 +61,7 @@ ALL_DEVICE_SPECS = [
     moto_edge_x30_specs.GPU,
     # GCP machines
     gcp_specs.GCP_C2_STANDARD_16,
+    gcp_specs.GCP_C2_STANDARD_60,
     gcp_specs.GCP_A2_HIGHGPU_1G,
     # RISCV emulators
     riscv_specs.EMULATOR_RISCV_32,

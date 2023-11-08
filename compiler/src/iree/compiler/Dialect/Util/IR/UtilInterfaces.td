@@ -915,6 +915,28 @@ def Util_SizeAwareOp : OpInterface<"SizeAwareOpInterface"> {
   ];
 }
 
+def Util_SizedStorageAttr : AttrInterface<"SizedStorageAttr"> {
+  let cppNamespace = "::mlir::iree_compiler::IREE::Util";
+
+  let description = [{
+    Interface used to query storage requirements for an attribute that is backed
+    by physical storage (memory, disk, or external API).
+  }];
+
+  let methods = [
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns the storage size in bytes required by the attribute value.
+        If the value is sub-byte aligned the storage size will be rounded up to
+        the next whole byte.
+      }],
+      /*retTy=*/"int64_t",
+      /*methodName=*/"getStorageSize",
+      /*args=*/(ins)
+    >,
+  ];
+}
+
 //===----------------------------------------------------------------------===//
 // IREE::Util::ReferenceTypeInterface
 //===----------------------------------------------------------------------===//
@@ -1088,7 +1110,10 @@ def Util_SubrangeOperandOpInterface : OpInterface<"SubrangeOperandOpInterface"> 
 // IREE::Util::SerializableAttrInterface
 //===----------------------------------------------------------------------===//
 
-def Util_SerializableAttrInterface : AttrInterface<"SerializableAttrInterface"> {
+def Util_SerializableAttrInterface :
+  AttrInterface<"SerializableAttrInterface", [
+    Util_SizedStorageAttr,
+  ]> {
   let cppNamespace = "::mlir::iree_compiler::IREE::Util";
 
   let description = [{
@@ -1102,17 +1127,6 @@ def Util_SerializableAttrInterface : AttrInterface<"SerializableAttrInterface"> 
   let methods = [
     InterfaceMethod<
       /*desc=*/[{
-        Returns the storage size in bytes required by the serialized value.
-        Any of the serialization methods will write precisely this number of
-        bytes. If the value is sub-byte aligned the storage size will be rounded
-        up to the next whole byte.
-      }],
-      /*retTy=*/"int64_t",
-      /*methodName=*/"getStorageSize",
-      /*args=*/(ins)
-    >,
-    InterfaceMethod<
-      /*desc=*/[{
         Serializes the attribute to the given byte vector. The vector will be
         resized to the total storage size upon return.
       }],
@@ -1120,7 +1134,7 @@ def Util_SerializableAttrInterface : AttrInterface<"SerializableAttrInterface"> 
       /*methodName=*/"serializeToVector",
       /*args=*/(ins
         "Location":$loc,
-        "llvm::support::endianness":$endian,
+        "llvm::endianness":$endian,
         "SmallVectorImpl<char> &":$buffer
       ),
       /*methodBody=*/[{}],
@@ -1138,7 +1152,7 @@ def Util_SerializableAttrInterface : AttrInterface<"SerializableAttrInterface"> 
       /*methodName=*/"serializeToBuffer",
       /*args=*/(ins
         "Location":$loc,
-        "llvm::support::endianness":$endian,
+        "llvm::endianness":$endian,
         "ArrayRef<char>":$buffer
       )
     >,
@@ -1151,7 +1165,7 @@ def Util_SerializableAttrInterface : AttrInterface<"SerializableAttrInterface"> 
       /*methodName=*/"serializeToStream",
       /*args=*/(ins
         "Location":$loc,
-        "llvm::support::endianness":$endian,
+        "llvm::endianness":$endian,
         "llvm::raw_ostream &":$os
       ),
       /*methodBody=*/[{}],

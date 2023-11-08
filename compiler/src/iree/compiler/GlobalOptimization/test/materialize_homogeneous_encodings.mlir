@@ -10,15 +10,15 @@ module attributes {hal.device.targets = [#device_target_llvm_cpu]} {
     %c1 = arith.constant 1 : index
     %dim = tensor.dim %arg0, %c0 : tensor<?x?xf32>
     %dim_0 = tensor.dim %arg0, %c1 : tensor<?x?xf32>
-    %0:2 = iree_linalg_ext.upper_bound_tile_size tensor<?x?xf32, #iree_linalg_ext.encoding<user = MATMUL_F32F32F32, role = LHS>> -> index, index
+    %0:2 = iree_linalg_ext.upper_bound_tile_size tensor<?x?xf32, #iree_linalg_ext.encoding<user = MATMUL, role = LHS, element_types = [f32, f32, f32]>> -> index, index
     %1 = affine.apply #map()[%0#0, %dim]
     %2 = affine.apply #map()[%0#1, %dim_0]
     %padded = tensor.pad %arg0 low[0, 0] high[%1, %2] {
     ^bb0(%arg1: index, %arg2: index):
       tensor.yield %cst : f32
     } : tensor<?x?xf32> to tensor<?x?xf32>
-    %3 = iree_linalg_ext.set_encoding %padded : tensor<?x?xf32> -> tensor<?x?xf32, #iree_linalg_ext.encoding<user = MATMUL_F32F32F32, role = LHS>>
-    %4 = iree_linalg_ext.unset_encoding %3 : tensor<?x?xf32, #iree_linalg_ext.encoding<user = MATMUL_F32F32F32, role = LHS>> -> tensor<?x?xf32>
+    %3 = iree_linalg_ext.set_encoding %padded : tensor<?x?xf32> -> tensor<?x?xf32, #iree_linalg_ext.encoding<user = MATMUL, role = LHS, element_types = [f32, f32, f32]>>
+    %4 = iree_linalg_ext.unset_encoding %3 : tensor<?x?xf32, #iree_linalg_ext.encoding<user = MATMUL, role = LHS, element_types = [f32, f32, f32]>> -> tensor<?x?xf32>
     return %4 : tensor<?x?xf32>
   }
 }
@@ -38,20 +38,20 @@ module attributes {hal.device.targets = [#device_target_vulkan]} {
     %c1 = arith.constant 1 : index
     %dim = tensor.dim %arg0, %c0 : tensor<?x?xf32>
     %dim_0 = tensor.dim %arg0, %c1 : tensor<?x?xf32>
-    %0:2 = iree_linalg_ext.upper_bound_tile_size tensor<?x?xf32, #iree_linalg_ext.encoding<user = MATMUL_F32F32F32, role = LHS>> -> index, index
+    %0:2 = iree_linalg_ext.upper_bound_tile_size tensor<?x?xf32, #iree_linalg_ext.encoding<user = MATMUL, role = LHS, element_types = [f32, f32, f32]>> -> index, index
     %1 = affine.apply #map()[%0#0, %dim]
     %2 = affine.apply #map()[%0#1, %dim_0]
     %padded = tensor.pad %arg0 low[0, 0] high[%1, %2] {
     ^bb0(%arg1: index, %arg2: index):
       tensor.yield %cst : f32
     } : tensor<?x?xf32> to tensor<?x?xf32>
-    %3 = iree_linalg_ext.set_encoding %padded : tensor<?x?xf32> -> tensor<?x?xf32, #iree_linalg_ext.encoding<user = MATMUL_F32F32F32, role = LHS>>
-    %4 = iree_linalg_ext.unset_encoding %3 : tensor<?x?xf32, #iree_linalg_ext.encoding<user = MATMUL_F32F32F32, role = LHS>> -> tensor<?x?xf32>
+    %3 = iree_linalg_ext.set_encoding %padded : tensor<?x?xf32> -> tensor<?x?xf32, #iree_linalg_ext.encoding<user = MATMUL, role = LHS, element_types = [f32, f32, f32]>>
+    %4 = iree_linalg_ext.unset_encoding %3 : tensor<?x?xf32, #iree_linalg_ext.encoding<user = MATMUL, role = LHS, element_types = [f32, f32, f32]>> -> tensor<?x?xf32>
     return %4 : tensor<?x?xf32>
   }
 }
 
-// vulkan does not implement buildMaterializeEncodingsPassPipeline method.
+// vulkan uses default materialization patterns which unsets the encodings.
 // CHECK-LABEL: func.func @lhs_encoding
-// CHECK:         iree_linalg_ext.upper_bound_tile_size
-// CHECK:         iree_linalg_ext.set_encoding
+// CHECK-SAME:    %[[ARG0:[a-zA-Z0-9]+]]
+// CHECK:         return %[[ARG0]]

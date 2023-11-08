@@ -7,6 +7,7 @@
 #include "./binding.h"
 #include "./hal.h"
 #include "./invoke.h"
+#include "./io.h"
 #include "./numpy_interop.h"
 #include "./py_module.h"
 #include "./status_utils.h"
@@ -26,6 +27,7 @@ NB_MODULE(_runtime, m) {
   m.doc() = "IREE Binding Backend Helpers";
   SetupHalBindings(m);
   SetupInvokeBindings(m);
+  SetupIoBindings(m);
   SetupPyModuleBindings(m);
   SetupVmBindings(m);
 
@@ -48,6 +50,8 @@ NB_MODULE(_runtime, m) {
                                     &argc, &argv),
                    "Error parsing flags");
   });
+
+  m.def("disable_leak_checker", []() { py::set_leak_warnings(false); });
 }
 
 }  // namespace python

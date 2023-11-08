@@ -10,7 +10,6 @@
 #include <unordered_set>
 
 #include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtDialect.h"
-#include "iree-dialects/Dialect/LinalgTransform/LinalgTransformOps.h"
 #include "iree/compiler/Codegen/Dialect/IREECodegenDialect.h"
 #include "iree/compiler/Codegen/LLVMCPU/Passes.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
@@ -179,7 +178,6 @@ public:
     // clang-format off
     registry.insert<IREE::Codegen::IREECodegenDialect,
                     IREE::LinalgExt::IREELinalgExtDialect,
-                    linalg::transform::LinalgTransformDialect,
                     mlir::transform::TransformDialect,
                     pdl::PDLDialect,
                     pdl_interp::PDLInterpDialect,
@@ -209,8 +207,11 @@ public:
 
   std::optional<IREE::HAL::DeviceTargetAttr>
   getHostDeviceTarget(MLIRContext *context) const override {
-    return getDeviceTargetFromTarget(context, LLVMTarget::getForHost(),
-                                     defaultAddlConfig_);
+    std::optional<LLVMTarget> maybeTarget = LLVMTarget::createForHost();
+    if (!maybeTarget) {
+      return {};
+    }
+    return getDeviceTargetFromTarget(context, *maybeTarget, defaultAddlConfig_);
   }
 
   void buildTranslationPassPipeline(IREE::HAL::ExecutableVariantOp variantOp,
@@ -352,6 +353,8 @@ public:
     for (auto exportOp : variantOp.getBlock().getOps<ExecutableExportOp>()) {
       // Find the matching function in the LLVM module.
       auto *llvmFunc = llvmModule->getFunction(exportOp.getName());
+      if (!llvmFunc)
+        continue;
       llvmFunc->setLinkage(llvm::GlobalValue::LinkageTypes::InternalLinkage);
       llvmFunc->setDSOLocal(true);
 
@@ -406,8 +409,10 @@ public:
     if (!target.linkStatic) {
       // Grab a linker tool based on the options (and target environment).
       // This uses the defaultOptions_ in order to get paths and such, which
-      // are environmental.
-      linkerTool = LinkerTool::getForTarget(targetTriple, defaultOptions_);
+      // are environmental, but replace the target with the actual one.
+      LLVMTargetOptions options = defaultOptions_;
+      options.target = target;
+      linkerTool = LinkerTool::getForTarget(targetTriple, options);
       if (!linkerTool) {
         return mlir::emitError(variantOp.getLoc())
                << "failed to find a target linker for the given target triple '"
@@ -663,6 +668,10 @@ public:
                                       &objectData))) {
         return variantOp.emitError()
                << "failed to compile LLVM-IR module to an object file";
+      }
+      if (!options.dumpIntermediatesPath.empty()) {
+        dumpDataToPath(options.dumpIntermediatesPath, options.dumpBaseName,
+                       variantOp.getName(), ".o", objectData);
       }
       auto objectFile = Artifact::createTemporary(libraryName, "o");
       auto &os = objectFile.outputFile->os();

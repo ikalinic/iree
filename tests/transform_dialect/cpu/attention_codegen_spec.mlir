@@ -1,5 +1,8 @@
-transform.sequence failures(propagate) {
-  ^bb0(%variant_op: !transform.any_op):
+module attributes { transform.with_named_sequence } {
+
+  // Codegen.
+  transform.named_sequence @codegen(
+      %variant_op: !transform.any_op {transform.consumed}) {
 
     // Get attention op
     // ==========================================
@@ -7,8 +10,8 @@ transform.sequence failures(propagate) {
 
     // Tile and distribute to workgroups
     // ==========================================
-    %forall_grid, %tiled_attention =
-    transform.structured.tile_to_forall_op %attention num_threads [1]
+    %tiled_attention, %forall_grid =
+    transform.structured.tile_using_forall %attention num_threads [1]
       ( mapping = [#gpu.block<x>] )
       : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     transform.iree.populate_workgroup_count_region_using_num_threads_slice %forall_grid
@@ -18,7 +21,7 @@ transform.sequence failures(propagate) {
     // ==========================================
     %attention2 = transform.structured.match ops{["iree_linalg_ext.attention"]} in %variant_op : (!transform.any_op) -> !transform.any_op
     %acc_fill, %max_fill, %sum_fill, %inner_loop, %fill_op, %first_matmul, %reduce_max, %partial_softmax, %update, %reduce_sum,
-    %reciprocal_sum, %softmax, %scale_acc, %second_matmul = tile_and_decompose_attention %attention2 :
+    %reciprocal_sum, %softmax, %scale_acc, %second_matmul = transform.tile_and_decompose_attention %attention2 :
        (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op,!transform.any_op,  !transform.any_op, !transform.any_op)
 
     // Vectorize function
@@ -57,5 +60,23 @@ transform.sequence failures(propagate) {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     transform.iree.apply_cse %func_8 : !transform.any_op
-    transform.iree.apply_buffer_optimizations %func_8 : (!transform.any_op) -> ()
-}
+    transform.memref.erase_dead_alloc_and_stores %func_8 : (!transform.any_op) -> ()
+    transform.yield
+  } // codegen
+  
+  // Find `hal.executable.variant`.
+  transform.named_sequence @match_variant_for_codegen(%root: !transform.any_op {transform.readonly}) 
+    -> !transform.any_op {
+    transform.match.operation_name %root ["hal.executable.variant"] : !transform.any_op
+    transform.yield %root : !transform.any_op
+  }
+
+  // Transform entry-point
+  transform.named_sequence @__transform_main(%root: !transform.any_op {transform.consumed}) {
+    transform.foreach_match in %root
+        @match_variant_for_codegen -> @codegen
+      : (!transform.any_op) -> (!transform.any_op)
+    transform.yield 
+  }
+} // module
+

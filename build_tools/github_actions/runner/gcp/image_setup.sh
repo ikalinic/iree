@@ -186,12 +186,20 @@ EOF
   rm -rf /home/*/snap
   rm -rf /root/snap
 
-  local gcloud_checksum="e0382917353272655959bb650643c5df72c85de326a720b97e562bb6ea4478b1"
-
-  nice_curl \
-    https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-414.0.0-linux-x86_64.tar.gz \
-    --output gcloud.tar.gz
-  echo "${gcloud_checksum} *gcloud.tar.gz" | sha256sum --check --strict
+  GCLOUD_CLI_VERSION="414.0.0"
+  if [[ "${RUNNER_TYPE^^}" != ARM64 ]]; then
+    local gcloud_checksum="e0382917353272655959bb650643c5df72c85de326a720b97e562bb6ea4478b1"
+    nice_curl \
+      https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-${GCLOUD_CLI_VERSION}-linux-x86_64.tar.gz \
+      --output gcloud.tar.gz
+    echo "${gcloud_checksum} *gcloud.tar.gz" | sha256sum --check --strict
+  else
+    local gcloud_checksum="6f9186bc2b90b9140b3fbc8db121da71638b4a5c91c05c4f77e188bde20f692c"
+    nice_curl \
+      https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-${GCLOUD_CLI_VERSION}-linux-arm.tar.gz \
+      --output gcloud.tar.gz
+    echo "${gcloud_checksum} *gcloud.tar.gz" | sha256sum --check --strict
+  fi
   tar -xf gcloud.tar.gz
   rm gcloud.tar.gz
   google-cloud-sdk/install.sh --quiet
@@ -317,9 +325,9 @@ EOF
           bash -c "${script_dir}/check_cuda.sh && ${script_dir}/check_vulkan.sh"
     }
 
-    check_docker gcr.io/iree-oss/nvidia@sha256:4e814f5f3bac53c88b64f0fe89af9f3dcc43bcf8610ea8b4511e21015ad1fb9c
-    check_docker gcr.io/iree-oss/frontends-nvidia@sha256:0451c9e93c2d938c08b767e2deb1870fdf98060a1b01685cbacbf3f50e677fc5
-    check_docker gcr.io/iree-oss/nvidia-bleeding-edge@sha256:522491c028ec3b4070f23910c70c8162fd9612e11d9cf062a13444df7e88ab70
+    check_docker gcr.io/iree-oss/nvidia@sha256:4bc8f74e6f8dece34184eedfafede9c28ba3af1674e6774f5cd867802beffc9b
+    check_docker gcr.io/iree-oss/frontends-nvidia@sha256:c3d590c6f1a6369cd34ccf0fc6f9ca2fbf8ee06abdc58a2827fc847718c308b8
+    check_docker gcr.io/iree-oss/nvidia-bleeding-edge@sha256:2eb17e2e8e0d5d25600e667e3b7a71e8d39d9d12a99ec2ad6bdabbc8919db43b
 
     # Remove the docker images we've fetched. We might want to pre-fetch Docker
     # images into the VM image, but that should be a separate decision.

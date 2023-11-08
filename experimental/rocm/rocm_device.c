@@ -103,6 +103,7 @@ static iree_status_t iree_hal_rocm_device_create_internal(
   device->device = rocm_device;
   device->stream = stream;
   device->context_wrapper.rocm_context = context;
+  device->context_wrapper.rocm_device = rocm_device;
   device->context_wrapper.host_allocator = host_allocator;
   device->context_wrapper.syms = syms;
   // Enable tracing for the (currently only) stream - no-op if disabled.
@@ -130,7 +131,11 @@ iree_status_t iree_hal_rocm_device_create(iree_hal_driver_t* driver,
   IREE_TRACE_ZONE_BEGIN(z0);
   hipCtx_t context;
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
-      z0, ROCM_RESULT_TO_STATUS(syms, hipCtxCreate(&context, 0, device)));
+      z0,
+      ROCM_RESULT_TO_STATUS(syms, hipDevicePrimaryCtxRetain(&context, device)));
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, ROCM_RESULT_TO_STATUS(syms, hipCtxSetCurrent(context)));
+
   hipStream_t stream;
   iree_status_t status = ROCM_RESULT_TO_STATUS(
       syms, hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
@@ -144,7 +149,7 @@ iree_status_t iree_hal_rocm_device_create(iree_hal_driver_t* driver,
     if (stream) {
       syms->hipStreamDestroy(stream);
     }
-    syms->hipCtxDestroy(context);
+    syms->hipDevicePrimaryCtxRelease(device);
   }
   IREE_TRACE_ZONE_END(z0);
   return status;
@@ -258,18 +263,16 @@ static iree_status_t iree_hal_rocm_device_create_executable_cache(
 
 static iree_status_t iree_hal_rocm_device_import_file(
     iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
-    iree_hal_memory_access_t access,
-    iree_hal_external_file_t* IREE_RESTRICT external_file,
-    iree_hal_file_release_callback_t release_callback,
-    iree_hal_file_t** out_file) {
-  if (external_file->type != IREE_HAL_EXTERNAL_FILE_TYPE_HOST_ALLOCATION) {
+    iree_hal_memory_access_t access, iree_io_file_handle_t* handle,
+    iree_hal_external_file_flags_t flags, iree_hal_file_t** out_file) {
+  if (iree_io_file_handle_type(handle) !=
+      IREE_IO_FILE_HANDLE_TYPE_HOST_ALLOCATION) {
     return iree_make_status(
         IREE_STATUS_UNAVAILABLE,
         "implementation does not support the external file type");
   }
   return iree_hal_memory_file_wrap(
-      queue_affinity, access, external_file->handle.host_allocation,
-      release_callback, iree_hal_device_allocator(base_device),
+      queue_affinity, access, handle, iree_hal_device_allocator(base_device),
       iree_hal_device_host_allocator(base_device), out_file);
 }
 

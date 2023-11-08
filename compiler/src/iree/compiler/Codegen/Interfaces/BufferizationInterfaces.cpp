@@ -15,7 +15,7 @@
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/IR/BufferizableOpInterface.h"
-#include "mlir/Dialect/Bufferization/IR/SubsetInsertionOpInterface.h"
+#include "mlir/Dialect/Bufferization/IR/DstBufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
 #include "mlir/Dialect/Bufferization/Transforms/Transforms.h"
@@ -25,8 +25,10 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Interfaces/SubsetOpInterface.h"
 #include "mlir/Support/LLVM.h"
 
+using mlir::SubsetInsertionOpInterface;
 using mlir::bufferization::AliasingOpOperand;
 using mlir::bufferization::AliasingOpOperandList;
 using mlir::bufferization::AliasingValue;
@@ -39,7 +41,6 @@ using mlir::bufferization::OneShotAnalysisState;
 using mlir::bufferization::OneShotBufferizationOptions;
 using mlir::bufferization::replaceOpWithBufferizedValues;
 using mlir::bufferization::replaceOpWithNewBufferizedOp;
-using mlir::bufferization::SubsetInsertionOpInterface;
 
 namespace mlir {
 namespace iree_compiler {
@@ -344,57 +345,14 @@ static LogicalResult bufferizeLinalgExtOp(RewriterBase &rewriter,
 /// a new op that operates entirely on memrefs.
 template <typename OpTy>
 struct LinalgExtOpInterface
-    : public BufferizableOpInterface::ExternalModel<LinalgExtOpInterface<OpTy>,
-                                                    OpTy> {
+    : public bufferization::DstBufferizableOpInterfaceExternalModel<
+          LinalgExtOpInterface<OpTy>, OpTy> {
+
   bool bufferizesToMemoryRead(Operation *op, OpOperand &opOperand,
                               const AnalysisState &state) const {
-    // TODO: Implement payloadUsesValueFromOperand for individual ops. There
-    // are a limited number of LinalgExt ops, so we hardcode them here. We don't
-    // expect to add more LinalgExt ops.
-    if (!cast<DestinationStyleOpInterface>(op).isDpsInit(&opOperand))
-      return true;
+    // TODO: Revisit this for Scatter/ReverseOp. We can then get rid of
+    //       `bufferizesToMemoryRead` completely.
     return !isa<IREE::LinalgExt::ScatterOp, IREE::LinalgExt::ReverseOp>(op);
-  }
-
-  bool bufferizesToMemoryWrite(Operation *op, OpOperand &opOperand,
-                               const AnalysisState &state) const {
-    // Operand is written to if it has an aliasing OpResult.
-    auto bufferizableOp = cast<BufferizableOpInterface>(op);
-    return !bufferizableOp.getAliasingValues(opOperand, state)
-                .getAliases()
-                .empty();
-  }
-
-  bufferization::AliasingOpOperandList
-  getAliasingOpOperands(Operation *op, Value value,
-                        const AnalysisState &state) const {
-    size_t resultNum = std::distance(op->getOpResults().begin(),
-                                     llvm::find(op->getOpResults(), value));
-    // The i-th OpResult may alias with the i-th "out" tensor.
-    return {AliasingOpOperand(
-        &cast<DestinationStyleOpInterface>(op).getDpsInitsMutable()[resultNum],
-        BufferRelation::Equivalent,
-        /*isDefinite=*/false)};
-  }
-
-  bufferization::AliasingValueList
-  getAliasingValues(Operation *op, OpOperand &opOperand,
-                    const AnalysisState &state) const {
-    auto dspOp = cast<DestinationStyleOpInterface>(op);
-
-    // The i-th "out" tensor may alias with the i-th OpResult.
-    if (dspOp.isDpsInit(&opOperand)) {
-      return {AliasingValue(dspOp.getTiedOpResult(&opOperand) /*result*/,
-                            BufferRelation::Equivalent,
-                            /*isDefinite=*/false)};
-    }
-    return {};
-  }
-
-  bufferization::BufferRelation
-  bufferRelation(Operation *op, OpResult opResult,
-                 const AnalysisState &state) const {
-    return bufferization::BufferRelation::Equivalent;
   }
 
   LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
@@ -544,23 +502,58 @@ struct PackUnPackOpInterface
   }
 };
 
-/// Returns true if the value of a `storeOp` bufferizes to an equivalent
-/// DispatchTensorLoadOp result that bufferizes inplace.
-static bool isValueEquivalentToAnInplaceTensorLoadOp(
-    IREE::Flow::DispatchTensorStoreOp storeOp, Value candidate,
-    function_ref<bool(Value, Value)> equivalenceFn) {
-  auto loadOp = candidate.getDefiningOp<IREE::Flow::DispatchTensorLoadOp>();
-  if (!loadOp)
+struct DispatchTensorLoadOpSubsetInterface
+    : public SubsetOpInterface::ExternalModel<
+          DispatchTensorLoadOpSubsetInterface,
+          IREE::Flow::DispatchTensorLoadOp> {
+  bool operatesOnEquivalentSubset(
+      Operation *op, SubsetOpInterface candidate,
+      function_ref<bool(Value, Value)> equivalenceFn) const {
+    // Returns true if the value of a `loadOp` bufferizes to an equivalent
+    // DispatchTensorStoreOp result that bufferizes inplace.
+    auto loadOp = cast<IREE::Flow::DispatchTensorLoadOp>(op);
+    auto storeOp = dyn_cast<IREE::Flow::DispatchTensorStoreOp>(op);
+    if (!storeOp)
+      return false;
+    return equivalenceFn(loadOp.getSource(), storeOp.getTarget());
+  }
+
+  bool operatesOnDisjointSubset(
+      Operation *op, SubsetOpInterface candidate,
+      function_ref<bool(Value, Value)> equivalenceFn) const {
+    // TODO: This is a new entry point and not clear it is correct.
     return false;
-  if (!equivalenceFn(loadOp.getSource(), storeOp.getTarget()))
-    return false;
-  // TODO: Assert that offsets, sizes and strides are the same.
-  return true;
-}
+  }
+};
 
 struct DispatchTensorStoreOpSubsetInterface
-    : public SubsetInsertionOpInterface::ExternalModel<
+    : public SubsetOpInterface::ExternalModel<
           DispatchTensorStoreOpSubsetInterface,
+          IREE::Flow::DispatchTensorStoreOp> {
+
+  bool operatesOnEquivalentSubset(
+      Operation *op, SubsetOpInterface candidate,
+      function_ref<bool(Value, Value)> equivalenceFn) const {
+    // Returns true if the value of a `storeOp` bufferizes to an equivalent
+    // DispatchTensorLoadOp result that bufferizes inplace.
+    auto storeOp = cast<IREE::Flow::DispatchTensorStoreOp>(op);
+    auto loadOp = dyn_cast<IREE::Flow::DispatchTensorLoadOp>(op);
+    if (!loadOp)
+      return false;
+    return equivalenceFn(loadOp.getSource(), storeOp.getTarget());
+  }
+
+  bool operatesOnDisjointSubset(
+      Operation *op, SubsetOpInterface candidate,
+      function_ref<bool(Value, Value)> equivalenceFn) const {
+    // TODO: This is a new entry point and not clear it is correct.
+    return false;
+  }
+};
+
+struct DispatchTensorStoreOpSubsetInsertionInterface
+    : public SubsetInsertionOpInterface::ExternalModel<
+          DispatchTensorStoreOpSubsetInsertionInterface,
           IREE::Flow::DispatchTensorStoreOp> {
 
   OpOperand &getSourceOperand(Operation *op) const {
@@ -569,14 +562,6 @@ struct DispatchTensorStoreOpSubsetInterface
 
   OpOperand &getDestinationOperand(Operation *op) const {
     return op->getOpOperand(1);
-  }
-
-  bool
-  isEquivalentSubset(Operation *op, Value candidate,
-                     function_ref<bool(Value, Value)> equivalenceFn) const {
-    auto storeOp = cast<IREE::Flow::DispatchTensorStoreOp>(op);
-    return isValueEquivalentToAnInplaceTensorLoadOp(storeOp, candidate,
-                                                    equivalenceFn);
   }
 
   Value buildSubsetExtraction(Operation *op, OpBuilder &builder,
@@ -622,12 +607,19 @@ void registerBufferizationInterfaces(DialectRegistry &registry) {
   // Register IREE operations.
   registry.addExtension(
       +[](MLIRContext *ctx, IREE::Flow::FlowDialect *dialect) {
+        // DispatchTensorLoadOp
         IREE::Flow::DispatchTensorLoadOp::attachInterface<
             DispatchTensorLoadOpInterface>(*ctx);
+        IREE::Flow::DispatchTensorLoadOp::attachInterface<
+            DispatchTensorLoadOpSubsetInterface>(*ctx);
+
+        // DispatchTensorStoreOp
         IREE::Flow::DispatchTensorStoreOp::attachInterface<
             DispatchTensorStoreOpInterface>(*ctx);
         IREE::Flow::DispatchTensorStoreOp::attachInterface<
             DispatchTensorStoreOpSubsetInterface>(*ctx);
+        IREE::Flow::DispatchTensorStoreOp::attachInterface<
+            DispatchTensorStoreOpSubsetInsertionInterface>(*ctx);
       });
   registry.addExtension(+[](MLIRContext *ctx,
                             IREE::LinalgExt::IREELinalgExtDialect *dialect) {
@@ -651,8 +643,6 @@ void registerBufferizationInterfaces(DialectRegistry &registry) {
         LinalgExtOpInterface<IREE::LinalgExt::WinogradInputTransformOp>>(*ctx);
     IREE::LinalgExt::WinogradOutputTransformOp::attachInterface<
         LinalgExtOpInterface<IREE::LinalgExt::WinogradOutputTransformOp>>(*ctx);
-    IREE::LinalgExt::SoftmaxOp::attachInterface<
-        LinalgExtOpInterface<IREE::LinalgExt::SoftmaxOp>>(*ctx);
     IREE::LinalgExt::AttentionOp::attachInterface<
         LinalgExtOpInterface<IREE::LinalgExt::AttentionOp>>(*ctx);
   });

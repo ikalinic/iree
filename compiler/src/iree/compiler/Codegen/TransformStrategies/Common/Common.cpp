@@ -9,6 +9,7 @@
 #include "iree-dialects/Dialect/LinalgTransform/StructuredTransformOpsExt.h"
 #include "iree/compiler/Codegen/Common/TransformExtensions/CommonExtensions.h"
 #include "iree/compiler/Codegen/TransformStrategies/Common/AbstractReductionStrategy.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -27,7 +28,6 @@ using namespace mlir;
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 // TODO: significantly better namespacing.
-using iree_compiler::IREE::transform_dialect::ApplyBufferOptimizationsOp;
 using iree_compiler::IREE::transform_dialect::ForallToWorkgroupOp;
 using iree_compiler::IREE::transform_dialect::IREEBufferizeOp;
 using iree_compiler::IREE::transform_dialect::IREEEliminateEmptyTensorsOp;
@@ -36,12 +36,13 @@ using iree_compiler::IREE::transform_dialect::
 using transform::FuseIntoContainingOp;
 using transform::HoistRedundantTensorSubsetsOp;
 using transform::MatchOp;
+using transform::MemRefEraseDeadAllocAndStoresOp;
 using transform::MergeHandlesOp;
+using transform::NamedSequenceOp;
 using transform::PrintOp;
-using transform::SequenceOp;
 using transform::SplitHandleOp;
 using transform::SplitReductionOp;
-using transform::TileToForallOp;
+using transform::TileUsingForallOp;
 using transform::VectorizeChildrenAndApplyPatternsOp;
 using transform_ext::RegisterMatchCallbacksOp;
 using transform_ext::TakeFirstOp;
@@ -96,17 +97,25 @@ void mlir::iree_compiler::createTransformRegion(
   OpBuilder b(ctx);
   b.setInsertionPointAfter(entryPoint);
   auto topLevelTransformModule = b.create<ModuleOp>(loc);
+  topLevelTransformModule->setAttr(
+      transform::TransformDialect::kWithNamedSequenceAttrName, b.getUnitAttr());
   Region &topLevelTransformRegion = topLevelTransformModule.getBodyRegion();
   b.setInsertionPointToStart(&topLevelTransformRegion.front());
   auto anyOpType = transform::AnyOpType::get(b.getContext());
-  auto sequence = b.create<transform::SequenceOp>(
-      loc, TypeRange{}, transform::FailurePropagationMode::Propagate, anyOpType,
-      [&](OpBuilder &b, Location loc, Value variantH) {
+  auto sequence = b.create<transform::NamedSequenceOp>(
+      loc,
+      /*symName=*/
+      std::string(
+          transform::TransformDialect::kTransformEntryPointSymbolName.str()),
+      /*rootType*/ anyOpType,
+      /*resultTypes=*/TypeRange{},
+      /*bodyBuilder=*/[&](OpBuilder &b, Location loc, Value variantH) {
         ImplicitLocOpBuilder ib(loc, b);
         buildStrategy(ib, variantH);
         b.create<transform::YieldOp>(loc);
       });
   (void)sequence;
+
   LDBG("transformation script:\n");
   LDBG("verification: " << sequence.verify().succeeded() << "\n");
 }
@@ -170,7 +179,7 @@ mlir::iree_compiler::buildTileFuseToScfFor(ImplicitLocOpBuilder &b,
                                            bool canonicalize) {
   assert(opsHToFuse.empty() && "No fusion supported yet");
   iree_compiler::TileToScfForAndFuseResult result;
-  auto tiletoScfForOp = b.create<transform::TileOp>(rootH, tileSizes);
+  auto tiletoScfForOp = b.create<transform::TileUsingForOp>(rootH, tileSizes);
   result.forLoops = tiletoScfForOp.getLoops();
   result.tiledOpH = tiletoScfForOp.getTiledLinalgOp();
 
@@ -213,7 +222,7 @@ buildTileAndFuseAndDistributeImpl(ImplicitLocOpBuilder &b, Value variantH,
                                   ArrayRef<OpFoldResult> tileSizesOrNumThreads,
                                   ArrayAttr threadDimMapping) {
   iree_compiler::TileToForallAndFuseAndDistributeResult result;
-  auto tileToForeachOp = b.create<TileToForallOp>(
+  auto tileToForeachOp = b.create<TileUsingForallOp>(
       rootH, tileSizesOrNumThreads, TileOrNumThreadSpec(), threadDimMapping);
 
   result.forallH = tileToForeachOp.getForallOp();
@@ -503,6 +512,6 @@ Value mlir::iree_compiler::buildMemoryOptimizations(ImplicitLocOpBuilder &b,
           b.create<transform::ApplyCastAwayVectorLeadingOneDimPatternsOp>(loc);
         });
   }
-  b.create<ApplyBufferOptimizationsOp>(funcH);
+  b.create<MemRefEraseDeadAllocAndStoresOp>(funcH);
   return funcH;
 }

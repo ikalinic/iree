@@ -11,7 +11,6 @@
 #include <string.h>
 
 #include "experimental/cuda2/cuda_allocator.h"
-#include "experimental/cuda2/cuda_buffer.h"
 #include "experimental/cuda2/cuda_dynamic_symbols.h"
 #include "experimental/cuda2/cuda_status_util.h"
 #include "experimental/cuda2/event_pool.h"
@@ -23,6 +22,7 @@
 #include "experimental/cuda2/nop_executable_cache.h"
 #include "experimental/cuda2/pending_queue_actions.h"
 #include "experimental/cuda2/pipeline_layout.h"
+#include "experimental/cuda2/stream_command_buffer.h"
 #include "experimental/cuda2/timepoint_pool.h"
 #include "experimental/cuda2/tracing.h"
 #include "iree/base/internal/arena.h"
@@ -109,6 +109,7 @@ IREE_API_EXPORT void iree_hal_cuda2_device_params_initialize(
   out_params->arena_block_size = 32 * 1024;
   out_params->event_pool_capacity = 32;
   out_params->queue_count = 1;
+  out_params->command_buffer_mode = IREE_HAL_CUDA_COMMAND_BUFFER_MODE_GRAPH;
   out_params->stream_tracing = false;
   out_params->async_allocations = true;
 }
@@ -517,16 +518,41 @@ static iree_status_t iree_hal_cuda2_device_create_channel(
       params.count, device->host_allocator, out_channel);
 }
 
+iree_status_t iree_hal_cuda2_device_create_stream_command_buffer(
+    iree_hal_device_t* base_device, iree_hal_command_buffer_mode_t mode,
+    iree_hal_command_category_t command_categories,
+    iree_host_size_t binding_capacity,
+    iree_hal_command_buffer_t** out_command_buffer) {
+  iree_hal_cuda2_device_t* device = iree_hal_cuda2_device_cast(base_device);
+  return iree_hal_cuda2_stream_command_buffer_create(
+      base_device, device->cuda_symbols, device->nccl_symbols,
+      device->tracing_context, mode, command_categories, binding_capacity,
+      device->dispatch_cu_stream, &device->block_pool, device->host_allocator,
+      out_command_buffer);
+}
+
 static iree_status_t iree_hal_cuda2_device_create_command_buffer(
     iree_hal_device_t* base_device, iree_hal_command_buffer_mode_t mode,
     iree_hal_command_category_t command_categories,
     iree_hal_queue_affinity_t queue_affinity, iree_host_size_t binding_capacity,
     iree_hal_command_buffer_t** out_command_buffer) {
   iree_hal_cuda2_device_t* device = iree_hal_cuda2_device_cast(base_device);
-  return iree_hal_cuda2_graph_command_buffer_create(
-      base_device, device->cuda_symbols, device->cu_context, mode,
-      command_categories, queue_affinity, binding_capacity, &device->block_pool,
-      device->host_allocator, out_command_buffer);
+
+  switch (device->params.command_buffer_mode) {
+    case IREE_HAL_CUDA_COMMAND_BUFFER_MODE_GRAPH:
+      return iree_hal_cuda2_graph_command_buffer_create(
+          base_device, device->cuda_symbols, device->cu_context, mode,
+          command_categories, queue_affinity, binding_capacity,
+          &device->block_pool, device->host_allocator, out_command_buffer);
+    case IREE_HAL_CUDA_COMMAND_BUFFER_MODE_STREAM:
+      return iree_hal_deferred_command_buffer_create(
+          base_device, mode, command_categories, binding_capacity,
+          &device->block_pool, iree_hal_device_host_allocator(base_device),
+          out_command_buffer);
+    default:
+      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                              "invalid command buffer mode");
+  }
 }
 
 static iree_status_t iree_hal_cuda2_device_create_descriptor_set_layout(
@@ -558,18 +584,16 @@ static iree_status_t iree_hal_cuda2_device_create_executable_cache(
 
 static iree_status_t iree_hal_cuda2_device_import_file(
     iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
-    iree_hal_memory_access_t access,
-    iree_hal_external_file_t* IREE_RESTRICT external_file,
-    iree_hal_file_release_callback_t release_callback,
-    iree_hal_file_t** out_file) {
-  if (external_file->type != IREE_HAL_EXTERNAL_FILE_TYPE_HOST_ALLOCATION) {
+    iree_hal_memory_access_t access, iree_io_file_handle_t* handle,
+    iree_hal_external_file_flags_t flags, iree_hal_file_t** out_file) {
+  if (iree_io_file_handle_type(handle) !=
+      IREE_IO_FILE_HANDLE_TYPE_HOST_ALLOCATION) {
     return iree_make_status(
         IREE_STATUS_UNAVAILABLE,
         "implementation does not support the external file type");
   }
   return iree_hal_memory_file_wrap(
-      queue_affinity, access, external_file->handle.host_allocation,
-      release_callback, iree_hal_device_allocator(base_device),
+      queue_affinity, access, handle, iree_hal_device_allocator(base_device),
       iree_hal_device_host_allocator(base_device), out_file);
 }
 
@@ -625,7 +649,7 @@ static iree_status_t iree_hal_cuda2_device_queue_alloca(
   // allocator is set on the device.
   iree_status_t status = iree_ok_status();
   if (device->supports_memory_pools &&
-      !iree_any_bit_set(params.access, IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
+      !iree_all_bits_set(params.type, IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
     status = iree_hal_cuda2_memory_pools_alloca(
         &device->memory_pools, device->dispatch_cu_stream, pool, params,
         allocation_size, out_buffer);
@@ -730,7 +754,7 @@ static iree_status_t iree_hal_cuda2_device_queue_execute(
   IREE_TRACE_ZONE_BEGIN(z0);
 
   iree_status_t status = iree_hal_cuda2_pending_queue_actions_enqueue_execution(
-      device->dispatch_cu_stream, device->callback_cu_stream,
+      base_device, device->dispatch_cu_stream, device->callback_cu_stream,
       device->pending_queue_actions, wait_semaphore_list, signal_semaphore_list,
       command_buffer_count, command_buffers);
   if (iree_status_is_ok(status)) {

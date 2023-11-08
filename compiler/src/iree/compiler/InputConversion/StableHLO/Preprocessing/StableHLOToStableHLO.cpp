@@ -418,19 +418,17 @@ struct TransposeReshapeGenericDotGeneral final
     auto lhsNewType = cast<RankedTensorType>(lhs.getType());
     auto rhsNewType = cast<RankedTensorType>(rhs.getType());
 
-    // if lhs's shape or rhs's shape has collapsed, we need reshape the result
-    bool needReshapeResult = lhsNewType.getRank() < lhsShapeType.getRank() ||
-                             rhsNewType.getRank() < rhsShapeType.getRank();
     // batching、lhs parallel、rhs parallel this order is a conversion
-    SmallVector<int64_t> newShape = {lhsNewType.getShape()[0],
-                                     lhsNewType.getShape()[1]};
+    SmallVector<int64_t, 3> newShape = {lhsNewType.getShape()[0]};
+
+    if (lhsNewType.getRank() > 2)
+      newShape.push_back(lhsNewType.getDimSize(1));
+
     if (rhsNewType.getRank() > 2)
       newShape.push_back(rhsNewType.getDimSize(2));
 
     TensorType newResultType =
-        needReshapeResult
-            ? RankedTensorType::get(newShape, resultType.getElementType())
-            : op.getType();
+        RankedTensorType::get(newShape, resultType.getElementType());
 
     auto newOp = rewriter.create<mlir::stablehlo::DotGeneralOp>(
         op.getLoc(), newResultType, lhs, rhs, dimensionNumbers,
@@ -446,10 +444,11 @@ struct TransposeReshapeGenericDotGeneral final
     }
 
     Value result = newOp.getResult();
-    if (needReshapeResult) {
-      result = rewriter.create<mlir::stablehlo::ReshapeOp>(op.getLoc(),
-                                                           resultType, result);
+    if (op.getType() != newResultType) {
+      result = rewriter.create<mlir::stablehlo::ReshapeOp>(
+          op.getLoc(), op.getType(), newOp.getResult());
     }
+
     rewriter.replaceOp(op, result);
     return success();
   }
@@ -1220,6 +1219,13 @@ struct FuseWidenOperands final : OpRewritePattern<Op> {
       if (convertOp) {
         auto inputType = getElementTypeOrSelf(convertOp.getOperand().getType());
         auto castedType = getElementTypeOrSelf(convertOp.getResult().getType());
+        if (!isa<FloatType, IntegerType>(inputType) ||
+            !isa<FloatType, IntegerType>(castedType)) {
+          return rewriter.notifyMatchFailure(
+              op, "non-integer or floating point type");
+          ;
+        }
+
         if (inputType.getIntOrFloatBitWidth() <
             castedType.getIntOrFloatBitWidth()) {
           operands.push_back(convertOp.getOperand());
@@ -1777,7 +1783,7 @@ struct ApproxTopK final : OpRewritePattern<mlir::stablehlo::CustomCallOp> {
     if (!funcOp)
       return rewriter.notifyMatchFailure(op, "computation function not found.");
 
-    int64_t k = cast<ShapedType>(op.getType(0)).getDimSize(1);
+    int64_t k = cast<ShapedType>(op.getType(0)).getShape().back();
     auto input = op.getOperand(0);
     auto iota = op.getOperand(1);
 
@@ -1785,7 +1791,7 @@ struct ApproxTopK final : OpRewritePattern<mlir::stablehlo::CustomCallOp> {
             dyn_cast_or_null<mlir::stablehlo::IotaOp>(iota.getDefiningOp())) {
       int64_t iotaDim = iotaOp.getIotaDimension();
       auto iotaLastDim = cast<ShapedType>(iotaOp.getType()).getRank() - 1;
-      if (iotaDim != iotaLastDim || iotaLastDim != 1) {
+      if (iotaDim != iotaLastDim) {
         return rewriter.notifyMatchFailure(op, "Iota of last dim not found.");
       }
     }

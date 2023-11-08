@@ -405,6 +405,21 @@ IREE_API_EXPORT iree_status_t iree_hal_device_queue_dealloca(
     const iree_hal_semaphore_list_t signal_semaphore_list,
     iree_hal_buffer_t* buffer);
 
+// Enqueues a single queue-ordered fill operation.
+//
+// WARNING: individual fills have a high overhead and batching should be
+// performed by the caller instead of calling this multiple times. The
+// iree_hal_create_transfer_command_buffer utility makes it easy to create
+// batches of transfer operations (fill, copy, update) and is only a few lines
+// more code.
+IREE_API_EXPORT iree_status_t iree_hal_device_queue_fill(
+    iree_hal_device_t* device, iree_hal_queue_affinity_t queue_affinity,
+    const iree_hal_semaphore_list_t wait_semaphore_list,
+    const iree_hal_semaphore_list_t signal_semaphore_list,
+    iree_hal_buffer_t* target_buffer, iree_device_size_t target_offset,
+    iree_device_size_t length, const void* pattern,
+    iree_host_size_t pattern_length);
+
 // Enqueues a single queue-ordered copy operation.
 //
 // WARNING: individual copies have a high overhead and batching should be
@@ -594,10 +609,8 @@ typedef struct iree_hal_device_vtable_t {
 
   iree_status_t(IREE_API_PTR* import_file)(
       iree_hal_device_t* device, iree_hal_queue_affinity_t queue_affinity,
-      iree_hal_memory_access_t access,
-      iree_hal_external_file_t* IREE_RESTRICT external_file,
-      iree_hal_file_release_callback_t release_callback,
-      iree_hal_file_t** out_file);
+      iree_hal_memory_access_t access, iree_io_file_handle_t* handle,
+      iree_hal_external_file_flags_t flags, iree_hal_file_t** out_file);
 
   iree_status_t(IREE_API_PTR* create_pipeline_layout)(
       iree_hal_device_t* device, iree_host_size_t push_constants,

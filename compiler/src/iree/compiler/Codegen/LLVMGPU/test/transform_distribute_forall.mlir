@@ -7,7 +7,7 @@
 #pipeline_layout = #hal.pipeline.layout<push_constants = 0, sets = [<0, bindings = [<0, storage_buffer, ReadOnly>, <1, storage_buffer>]>]>
 #translation = #iree_codegen.translation_info<TransformDialectCodegen>
 hal.executable private @distribute {
-  hal.executable.variant public @cuda_nvptx_fb, target = #executable_target_cuda_nvptx_fb {
+  hal.executable.variant public @cuda_nvptx_fb target(#executable_target_cuda_nvptx_fb) {
 // CHECK: hal.executable.export {{.*}} attributes
 // CHECK-SAME: subgroup_size = 32
 // CHECK-SAME: workgroup_size = [256 : index, 1 : index, 1 : index]
@@ -43,27 +43,27 @@ hal.executable private @distribute {
         scf.forall (%arg0) in (%c8) {
           vector.transfer_write %cst_0, %subview[%arg0]
           {in_bounds = [true]} : vector<1xf16>, memref<1xf16, strided<[1], offset: ?>>
-        } {mapping = [#gpu.warp<x>]}        
+        } {mapping = [#gpu.warp<x>]}
         return
       }
-      module {
-        transform.sequence failures(propagate) {
-        ^bb0(%variant_op: !transform.any_op):
-        %17 = transform.structured.match ops{["func.func"]} in %variant_op 
-          : (!transform.any_op) -> !transform.any_op
-        transform.iree.map_nested_forall_to_gpu_threads %17 
-          workgroup_dims = [256, 1, 1] subgroup_size = 32 : (!transform.any_op) -> ()
+      builtin.module attributes { transform.with_named_sequence } {
+        transform.named_sequence @__transform_main(%variant_op: !transform.any_op {transform.readonly}) {
+          %17 = transform.structured.match ops{["func.func"]} in %variant_op
+            : (!transform.any_op) -> !transform.any_op
+          transform.iree.map_nested_forall_to_gpu_threads %17
+            workgroup_dims = [256, 1, 1] subgroup_size = 32 : (!transform.any_op) -> ()
 
-        // Late canonicalizations to cleanup and pass the checks.
-        // Needs to occur on the whole variant to perform cse on the workgroup_count region
-        %func_op = transform.structured.match ops{["func.func"]} in %variant_op : (!transform.any_op) -> !transform.any_op
-        transform.apply_patterns to %func_op {
-          transform.apply_patterns.canonicalization
-        } : !transform.any_op
-        transform.iree.apply_licm %func_op : !transform.any_op
-        transform.iree.apply_cse %func_op : !transform.any_op
-      }
+          // Late canonicalizations to cleanup and pass the checks.
+          // Needs to occur on the whole variant to perform cse on the workgroup_count region
+          %func_op = transform.structured.match ops{["func.func"]} in %variant_op : (!transform.any_op) -> !transform.any_op
+          transform.apply_patterns to %func_op {
+            transform.apply_patterns.canonicalization
+          } : !transform.any_op
+          transform.iree.apply_licm %func_op : !transform.any_op
+          transform.iree.apply_cse %func_op : !transform.any_op
+          transform.yield
+        } // @__transform_main
+      } // module
     }
   }
-}
 }

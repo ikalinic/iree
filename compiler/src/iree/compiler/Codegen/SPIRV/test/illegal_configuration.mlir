@@ -1,5 +1,5 @@
 // RUN: iree-opt \
-// RUN:   --pass-pipeline='builtin.module(hal.executable(hal.executable.variant(iree-spirv-lower-executable-target-pass{test-lowering-configuration=true})))' \
+// RUN:   --pass-pipeline='builtin.module(hal.executable(hal.executable.variant(iree-codegen-materialize-user-configs, iree-spirv-select-lowering-strategy-pass)))' \
 // RUN:   --verify-diagnostics --split-input-file %s
 
 #compilation = #iree_codegen.compilation_info<
@@ -14,13 +14,13 @@
   ]>
 ]>
 hal.executable private @matmul_tensors {
-  hal.executable.variant public @vulkan_spirv_fb, target = <"vulkan", "vulkan-spirv-fb", {
+  hal.executable.variant public @vulkan_spirv_fb target(<"vulkan", "vulkan-spirv-fb", {
       spirv.target_env = #spirv.target_env<#spirv.vce<v1.4, [Shader], []>, Unknown:IntegratedGPU, #spirv.resource_limits<
         max_compute_shared_memory_size = 16384,
         max_compute_workgroup_invocations = 128,
         max_compute_workgroup_size = [128, 128, 64],
         subgroup_size = 32>>
-    }> {
+    }>) {
     hal.executable.export @illegal layout(#pipeline_layout)
     builtin.module {
       func.func @illegal() {
@@ -41,8 +41,7 @@ hal.executable private @matmul_tensors {
 
 #compilation = #iree_codegen.compilation_info<
     lowering_config  = <tile_sizes = [[32, 64], [4, 4], [0, 0, 4]]>,
-    translation_info = <SPIRVMatmulPromoteVectorize>,
-    workgroup_size = []>
+    translation_info = <SPIRVMatmulPromoteVectorize>>
 #pipeline_layout = #hal.pipeline.layout<push_constants = 0, sets = [
   #hal.descriptor_set.layout<0, bindings = [
     #hal.descriptor_set.binding<0, storage_buffer>,
@@ -51,13 +50,13 @@ hal.executable private @matmul_tensors {
   ]>
 ]>
 hal.executable private @matmul_tensors {
-  hal.executable.variant public @vulkan_spirv_fb, target = <"vulkan", "vulkan-spirv-fb", {
+  hal.executable.variant public @vulkan_spirv_fb target(<"vulkan", "vulkan-spirv-fb", {
       spirv.target_env = #spirv.target_env<#spirv.vce<v1.4, [Shader], []>, Unknown:IntegratedGPU, #spirv.resource_limits<
         max_compute_shared_memory_size = 16384,
         max_compute_workgroup_invocations = 128,
         max_compute_workgroup_size = [128, 128, 64],
         subgroup_size = 32>>
-    }> {
+    }>) {
     hal.executable.export @illegal layout(#pipeline_layout)
     // expected-error @+1 {{expected workgroup size to have three dimensions for SPIR-V pipelines}}
     builtin.module {
@@ -88,13 +87,13 @@ hal.executable private @matmul_tensors {
   ]>
 ]>
 hal.executable private @matmul_tensors {
-  hal.executable.variant public @vulkan_spirv_fb, target = <"vulkan", "vulkan-spirv-fb", {
+  hal.executable.variant public @vulkan_spirv_fb target(<"vulkan", "vulkan-spirv-fb", {
       spirv.target_env = #spirv.target_env<#spirv.vce<v1.4, [Shader], []>, Unknown:IntegratedGPU, #spirv.resource_limits<
         max_compute_shared_memory_size = 16384,
         max_compute_workgroup_invocations = 128,
         max_compute_workgroup_size = [128, 128, 64],
         subgroup_size = 32>>
-    }> {
+    }>) {
     hal.executable.export @illegal layout(#pipeline_layout)
     builtin.module {
       func.func @illegal() {
@@ -125,13 +124,13 @@ hal.executable private @matmul_tensors {
   ]>
 ]>
 hal.executable private @matmul_tensors {
-  hal.executable.variant public @vulkan_spirv_fb, target = <"vulkan", "vulkan-spirv-fb", {
+  hal.executable.variant public @vulkan_spirv_fb target(<"vulkan", "vulkan-spirv-fb", {
       spirv.target_env = #spirv.target_env<#spirv.vce<v1.4, [Shader], []>, Unknown:IntegratedGPU, #spirv.resource_limits<
         max_compute_shared_memory_size = 16384,
         max_compute_workgroup_invocations = 128,
         max_compute_workgroup_size = [128, 128, 64],
         subgroup_size = 32>>
-    }> {
+    }>) {
     hal.executable.export @illegal layout(#pipeline_layout)
     builtin.module {
       func.func @illegal() {
@@ -162,13 +161,13 @@ hal.executable private @matmul_tensors {
   ]>
 ]>
 hal.executable private @matmul_tensors {
-  hal.executable.variant public @vulkan_spirv_fb, target = <"vulkan", "vulkan-spirv-fb", {
+  hal.executable.variant public @vulkan_spirv_fb target(<"vulkan", "vulkan-spirv-fb", {
       spirv.target_env = #spirv.target_env<#spirv.vce<v1.4, [Shader], []>, Unknown:IntegratedGPU, #spirv.resource_limits<
         max_compute_shared_memory_size = 16384,
         max_compute_workgroup_invocations = 128,
         max_compute_workgroup_size = [128, 128, 64],
         subgroup_size = 32>>
-    }> {
+    }>) {
     hal.executable.export @illegal layout(#pipeline_layout)
     builtin.module {
       func.func @illegal() {
@@ -199,13 +198,13 @@ hal.executable private @matmul_tensors {
   ]>
 ]>
 hal.executable private @matmul_tensors {
-  hal.executable.variant public @vulkan_spirv_fb, target = <"vulkan", "vulkan-spirv-fb", {
+  hal.executable.variant public @vulkan_spirv_fb target(<"vulkan", "vulkan-spirv-fb", {
       spirv.target_env = #spirv.target_env<#spirv.vce<v1.4, [Shader], []>, Unknown:IntegratedGPU, #spirv.resource_limits<
         max_compute_shared_memory_size = 16384,
         max_compute_workgroup_invocations = 128,
         max_compute_workgroup_size = [128, 128, 64],
         subgroup_size = 32>>
-    }> {
+    }>) {
     hal.executable.export @illegal layout(#pipeline_layout)
     builtin.module {
       func.func @illegal() {
@@ -236,13 +235,13 @@ hal.executable private @matmul_tensors {
   ]>
 ]>
 hal.executable private @matmul_tensors {
-  hal.executable.variant public @vulkan_spirv_fb, target = <"vulkan", "vulkan-spirv-fb", {
+  hal.executable.variant public @vulkan_spirv_fb target(<"vulkan", "vulkan-spirv-fb", {
       spirv.target_env = #spirv.target_env<#spirv.vce<v1.4, [Shader], []>, Unknown:IntegratedGPU, #spirv.resource_limits<
         max_compute_shared_memory_size = 16384,
         max_compute_workgroup_invocations = 128,
         max_compute_workgroup_size = [128, 128, 64],
         subgroup_size = 32>>
-    }> {
+    }>) {
     hal.executable.export @illegal layout(#pipeline_layout)
     builtin.module {
       func.func @illegal() {
@@ -273,13 +272,13 @@ hal.executable private @matmul_tensors {
   ]>
 ]>
 hal.executable private @matmul_tensors {
-  hal.executable.variant public @vulkan_spirv_fb, target = <"vulkan", "vulkan-spirv-fb", {
+  hal.executable.variant public @vulkan_spirv_fb target(<"vulkan", "vulkan-spirv-fb", {
       spirv.target_env = #spirv.target_env<#spirv.vce<v1.4, [Shader], []>, Unknown:IntegratedGPU, #spirv.resource_limits<
         max_compute_shared_memory_size = 16384,
         max_compute_workgroup_invocations = 128,
         max_compute_workgroup_size = [128, 128, 64],
         subgroup_size = 32>>
-    }> {
+    }>) {
     hal.executable.export @illegal layout(#pipeline_layout)
     builtin.module {
       func.func @illegal() {
@@ -310,7 +309,7 @@ hal.executable private @matmul_tensors {
   ]>
 ]>
 hal.executable public @matmul_tensor {
-  hal.executable.variant @vulkan, target = <"vulkan-spirv", "vulkan-spirv-fb", {
+  hal.executable.variant @vulkan target(<"vulkan-spirv", "vulkan-spirv-fb", {
     spirv.target_env = #spirv.target_env<
       #spirv.vce<v1.6,
       [Shader, Float16, StorageBuffer16BitAccess, StorageUniform16, CooperativeMatrixKHR],
@@ -325,7 +324,7 @@ hal.executable public @matmul_tensor {
         max_compute_workgroup_invocations = 1024,
         max_compute_workgroup_size = [1024, 1024, 1024],
         subgroup_size = 64, min_subgroup_size = 32, max_subgroup_size = 64>
-       >}> {
+       >}>) {
     hal.executable.export public @matmul_tensor layout(#pipeline_layout)
     builtin.module {
       func.func @matmul_tensor() {
@@ -363,7 +362,7 @@ hal.executable public @matmul_tensor {
   ]>
 ]>
 hal.executable public @matmul_tensor {
-  hal.executable.variant @vulkan, target = <"vulkan-spirv", "vulkan-spirv-fb", {
+  hal.executable.variant @vulkan target(<"vulkan-spirv", "vulkan-spirv-fb", {
     spirv.target_env = #spirv.target_env<
       #spirv.vce<v1.6,
       [Shader, Float16, StorageBuffer16BitAccess, StorageUniform16, CooperativeMatrixKHR],
@@ -378,7 +377,7 @@ hal.executable public @matmul_tensor {
         max_compute_workgroup_invocations = 1024,
         max_compute_workgroup_size = [1024, 1024, 1024],
         subgroup_size = 64, min_subgroup_size = 32, max_subgroup_size = 64>
-       >}> {
+       >}>) {
     hal.executable.export public @matmul_tensor layout(#pipeline_layout)
     builtin.module {
       func.func @matmul_tensor() {
@@ -416,7 +415,7 @@ hal.executable public @matmul_tensor {
   ]>
 ]>
 hal.executable public @matmul_tensor {
-  hal.executable.variant @vulkan, target = <"vulkan-spirv", "vulkan-spirv-fb", {
+  hal.executable.variant @vulkan target(<"vulkan-spirv", "vulkan-spirv-fb", {
     spirv.target_env = #spirv.target_env<
       #spirv.vce<v1.6,
       [Shader, Float16, StorageBuffer16BitAccess, StorageUniform16, CooperativeMatrixKHR],
@@ -431,7 +430,7 @@ hal.executable public @matmul_tensor {
         max_compute_workgroup_invocations = 1024,
         max_compute_workgroup_size = [1024, 1024, 1024],
         subgroup_size = 64, min_subgroup_size = 32, max_subgroup_size = 64>
-       >}> {
+       >}>) {
     hal.executable.export public @matmul_tensor layout(#pipeline_layout)
     builtin.module {
       func.func @matmul_tensor() {
@@ -469,7 +468,7 @@ hal.executable public @matmul_tensor {
   ]>
 ]>
 hal.executable public @matmul_tensor {
-  hal.executable.variant @vulkan, target = <"vulkan-spirv", "vulkan-spirv-fb", {
+  hal.executable.variant @vulkan target(<"vulkan-spirv", "vulkan-spirv-fb", {
     spirv.target_env = #spirv.target_env<
       #spirv.vce<v1.6,
       [Shader, Float16, StorageBuffer16BitAccess, StorageUniform16, CooperativeMatrixKHR],
@@ -484,7 +483,7 @@ hal.executable public @matmul_tensor {
         max_compute_workgroup_invocations = 1024,
         max_compute_workgroup_size = [1024, 1024, 1024],
         subgroup_size = 64, min_subgroup_size = 32, max_subgroup_size = 64>
-       >}> {
+       >}>) {
     hal.executable.export public @matmul_tensor layout(#pipeline_layout)
     builtin.module {
       func.func @matmul_tensor() {
@@ -522,7 +521,7 @@ hal.executable public @matmul_tensor {
   ]>
 ]>
 hal.executable public @matmul_tensor {
-  hal.executable.variant @vulkan, target = <"vulkan-spirv", "vulkan-spirv-fb", {
+  hal.executable.variant @vulkan target(<"vulkan-spirv", "vulkan-spirv-fb", {
     spirv.target_env = #spirv.target_env<
       #spirv.vce<v1.6,
       [Shader, Float16, StorageBuffer16BitAccess, StorageUniform16, CooperativeMatrixKHR],
@@ -537,7 +536,7 @@ hal.executable public @matmul_tensor {
         max_compute_workgroup_invocations = 1024,
         max_compute_workgroup_size = [1024, 1024, 1024],
         subgroup_size = 64, min_subgroup_size = 32, max_subgroup_size = 64>
-       >}> {
+       >}>) {
     hal.executable.export public @matmul_tensor layout(#pipeline_layout)
     builtin.module {
       func.func @matmul_tensor() {
@@ -575,13 +574,13 @@ hal.executable public @matmul_tensor {
   ]>
 ]>
 hal.executable private @conv_2d_nhwc_hwcf {
-  hal.executable.variant public @vulkan_spirv_fb, target = <"vulkan", "vulkan-spirv-fb", {
+  hal.executable.variant public @vulkan_spirv_fb target(<"vulkan", "vulkan-spirv-fb", {
       spirv.target_env = #spirv.target_env<#spirv.vce<v1.4, [Shader], []>, Unknown:IntegratedGPU, #spirv.resource_limits<
         max_compute_shared_memory_size = 16384,
         max_compute_workgroup_invocations = 128,
         max_compute_workgroup_size = [128, 128, 64],
         subgroup_size = 32>>
-    }> {
+    }>) {
     hal.executable.export @illegal layout(#pipeline_layout)
     builtin.module  {
       func.func @illegal() {
@@ -641,13 +640,13 @@ hal.executable private @conv_2d_nhwc_hwcf {
   ]>
 ]>
 hal.executable private @conv_2d_nhwc_hwcf {
-  hal.executable.variant public @vulkan_spirv_fb, target = <"vulkan", "vulkan-spirv-fb", {
+  hal.executable.variant public @vulkan_spirv_fb target(<"vulkan", "vulkan-spirv-fb", {
       spirv.target_env = #spirv.target_env<#spirv.vce<v1.4, [Shader], []>, Unknown:IntegratedGPU, #spirv.resource_limits<
         max_compute_shared_memory_size = 16384,
         max_compute_workgroup_invocations = 128,
         max_compute_workgroup_size = [128, 128, 64],
         subgroup_size = 32>>
-    }> {
+    }>) {
     hal.executable.export @illegal layout(#pipeline_layout)
     builtin.module  {
       func.func @illegal() {
@@ -707,13 +706,13 @@ hal.executable private @conv_2d_nhwc_hwcf {
   ]>
 ]>
 hal.executable private @conv_2d_nhwc_hwcf {
-  hal.executable.variant public @vulkan_spirv_fb, target = <"vulkan", "vulkan-spirv-fb", {
+  hal.executable.variant public @vulkan_spirv_fb target(<"vulkan", "vulkan-spirv-fb", {
       spirv.target_env = #spirv.target_env<#spirv.vce<v1.4, [Shader], []>, Unknown:IntegratedGPU, #spirv.resource_limits<
         max_compute_shared_memory_size = 16384,
         max_compute_workgroup_invocations = 128,
         max_compute_workgroup_size = [128, 128, 64],
         subgroup_size = 32>>
-    }> {
+    }>) {
     hal.executable.export @illegal layout(#pipeline_layout)
     builtin.module  {
       func.func @illegal() {
@@ -773,13 +772,13 @@ hal.executable private @conv_2d_nhwc_hwcf {
   ]>
 ]>
 hal.executable private @depthwise_conv_2d_nhwc_hwc {
-  hal.executable.variant public @vulkan_spirv_fb, target = <"vulkan", "vulkan-spirv-fb", {
+  hal.executable.variant public @vulkan_spirv_fb target(<"vulkan", "vulkan-spirv-fb", {
       spirv.target_env = #spirv.target_env<#spirv.vce<v1.4, [Shader], []>, Unknown:IntegratedGPU, #spirv.resource_limits<
         max_compute_shared_memory_size = 16384,
         max_compute_workgroup_invocations = 128,
         max_compute_workgroup_size = [128, 128, 64],
         subgroup_size = 32>>
-    }> {
+    }>) {
     hal.executable.export @illegal layout(#pipeline_layout)
     builtin.module {
       func.func @illegal() {
@@ -811,13 +810,13 @@ hal.executable private @depthwise_conv_2d_nhwc_hwc {
   ]>
 ]>
 hal.executable private @depthwise_conv_2d_nhwc_hwc {
-  hal.executable.variant public @vulkan_spirv_fb, target = <"vulkan", "vulkan-spirv-fb", {
+  hal.executable.variant public @vulkan_spirv_fb target(<"vulkan", "vulkan-spirv-fb", {
       spirv.target_env = #spirv.target_env<#spirv.vce<v1.4, [Shader], []>, Unknown:IntegratedGPU, #spirv.resource_limits<
         max_compute_shared_memory_size = 16384,
         max_compute_workgroup_invocations = 128,
         max_compute_workgroup_size = [128, 128, 64],
         subgroup_size = 32>>
-    }> {
+    }>) {
     hal.executable.export @illegal layout(#pipeline_layout)
     builtin.module {
       func.func @illegal() {

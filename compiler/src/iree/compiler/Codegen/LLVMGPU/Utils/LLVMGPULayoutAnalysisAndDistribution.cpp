@@ -372,7 +372,7 @@ static void propagateLayoutToFor(scf::ForOp forOp,
     BlockArgument &arg = argIndex.value();
     if (!layoutMap.count(arg))
       continue;
-    OpOperand &operand = forOp.getOpOperandForRegionIterArg(arg);
+    OpOperand &operand = *forOp.getTiedLoopInit(arg);
     Value result = forOp.getResult(argIndex.index());
     Layout newLayout = layoutMap.at(arg);
     layoutMap.try_emplace(operand.get(), newLayout);
@@ -1060,7 +1060,7 @@ static void distributeConstants(arith::ConstantOp constantOp,
   Value constant = constantOp.getResult();
   if (!layoutMap.count(constant))
     return;
-  auto attr = llvm::cast<DenseElementsAttr>(constantOp.getValue());
+  auto attr = llvm::cast<ElementsAttr>(constantOp.getValue());
   // Only handle splat values for now
   if (!attr.isSplat())
     return;

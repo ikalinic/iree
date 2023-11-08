@@ -92,16 +92,10 @@ EFFICIENTNET_B7_FP32_TORCH = common_definitions.Model(
 ID_FORMAT = string.Template("${model_id}-batch-${batch_size}")
 NAME_FORMAT = string.Template("${name}Batch${batch_size}")
 BERT_LARGE_FP32_URL = string.Template(
-    "https://storage.googleapis.com/iree-model-artifacts/pytorch/pt_models_20230813.929_1692010793/BERT_LARGE_FP32_PT_384XI32_BATCH${batch_size}/linalg.mlirbc"
+    "https://storage.googleapis.com/iree-model-artifacts/pytorch/pt_models_20231010.987_1696982151/BERT_LARGE_FP32_PT_384XI32_BATCH${batch_size}/linalg.mlirbc"
 )
 BERT_LARGE_FP16_URL = string.Template(
     "https://storage.googleapis.com/iree-model-artifacts/pytorch/pt_models_20230816.932_1692245822/BERT_LARGE_FP16_PT_384XI32_BATCH${batch_size}/linalg.mlirbc"
-)
-RESNET50_FP32_URL = string.Template(
-    "https://storage.googleapis.com/iree-model-artifacts/pytorch/pt_models_20230813.929_1692010793/RESNET50_FP32_PT_3X224X224XF32_BATCH${batch_size}/linalg.mlirbc"
-)
-RESNET50_FP16_URL = string.Template(
-    "https://storage.googleapis.com/iree-model-artifacts/pytorch/pt_models_20230816.932_1692245822/RESNET50_FP16_PT_3X224X224XF16_BATCH${batch_size}/linalg.mlirbc"
 )
 
 # Converted from https://huggingface.co/docs/transformers/v4.27.2/en/model_doc/bert#transformers.BertModel
@@ -123,57 +117,12 @@ BERT_LARGE_384_FP32_TORCH_BATCHES = model_utils.generate_batch_models(
     batch_sizes=[1, 16, 24, 32, 48, 64, 512, 1024, 1280],
 )
 
-# FP16 Versions
-BERT_LARGE_384_FP16_TORCH_BATCHES = model_utils.generate_batch_models(
-    id_template=model_utils.partial_template_substitute(
-        ID_FORMAT, model_id=unique_ids.MODEL_BERT_LARGE_384_FP16_TORCH
-    ),
-    name_template=model_utils.partial_template_substitute(
-        NAME_FORMAT, name="BertLargefp16PT"
-    ),
-    tags=["fp16", "transformer", "seqlen384"],
+FALCON7B_1X100XI64_GPTQ_TORCH = common_definitions.Model(
+    id=unique_ids.MODEL_FALCON7B_1X100XI64_GPTQ_TORCH,
+    name="Falcon7bGptqPT",
+    tags=["gptq", "transformer"],
     source_type=common_definitions.ModelSourceType.EXPORTED_LINALG_MLIR,
-    source_url_template=BERT_LARGE_FP16_URL,
+    source_url="https://storage.googleapis.com/iree-model-artifacts/pytorch/manual/falcon7b_gptq_linalg_zeroed_weights_1698708010.mlirbc",
     entry_function="forward",
-    input_type_templates=[
-        string.Template("${batch_size}x384xi64"),
-        string.Template("${batch_size}x384xi64"),
-    ],
-    # Batches >=512 are disabled due to OOM: https://github.com/openxla/openxla-benchmark/issues/122.
-    # batch_sizes=[1, 16, 24, 32, 48, 64, 512, 1024, 1280],
-    batch_sizes=[1, 16, 24, 32, 48, 64],
-)
-
-# Converted from https://pytorch.org/vision/main/models/generated/torchvision.models.resnet50.html
-RESNET50_3X224X224_FP32_TORCH_BATCHES = model_utils.generate_batch_models(
-    id_template=model_utils.partial_template_substitute(
-        ID_FORMAT, model_id=unique_ids.MODEL_RESNET50_3X224X224_FP32_TORCH
-    ),
-    name_template=model_utils.partial_template_substitute(
-        NAME_FORMAT, name="Resnet50PT"
-    ),
-    tags=["fp32", "cnn"],
-    source_type=common_definitions.ModelSourceType.EXPORTED_LINALG_MLIR,
-    source_url_template=RESNET50_FP32_URL,
-    entry_function="forward",
-    input_type_templates=[string.Template("${batch_size}x3x224x224xf32")],
-    batch_sizes=[1, 8, 64, 128, 256, 2048],
-)
-
-# FP16 Versions
-RESNET50_3X224X224_FP16_TORCH_BATCHES = model_utils.generate_batch_models(
-    id_template=model_utils.partial_template_substitute(
-        ID_FORMAT, model_id=unique_ids.MODEL_RESNET50_3X224X224_FP16_TORCH
-    ),
-    name_template=model_utils.partial_template_substitute(
-        NAME_FORMAT, name="Resnet50fp16PT"
-    ),
-    tags=["fp32", "cnn"],
-    source_type=common_definitions.ModelSourceType.EXPORTED_LINALG_MLIR,
-    source_url_template=RESNET50_FP16_URL,
-    entry_function="forward",
-    input_type_templates=[string.Template("${batch_size}x3x224x224xf16")],
-    # Batch 2048 is disabled due to OOM: https://github.com/openxla/openxla-benchmark/issues/122
-    # batch_sizes=[1, 8, 64, 128, 256, 2048],
-    batch_sizes=[1, 8, 64, 128, 256],
+    input_types=["1x100xi64"],
 )

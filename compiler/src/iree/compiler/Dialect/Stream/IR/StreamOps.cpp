@@ -57,14 +57,19 @@ verifyDispatchWorkload(Operation *op, IREE::Stream::ExecutableExportOp exportOp,
   // the workload here matches what is expected.
   if (!exportOp.getWorkgroupCount().empty()) {
     auto &workgroupCount = exportOp.getWorkgroupCount();
-    if (workgroupCount.getNumArguments() != workload.size()) {
+    auto explicitArgs = llvm::make_filter_range(
+        workgroupCount.getArgumentTypes(), [](Type type) {
+          return !type.hasTrait<
+              mlir::OpTrait::IREE::Util::ImplicitlyCaptured>();
+        });
+    if (llvm::range_size(explicitArgs) != workload.size()) {
       return op->emitOpError()
              << "workload mismatch; entry point expects "
-             << workgroupCount.getNumArguments()
+             << llvm::range_size(explicitArgs)
              << " arguments but dispatch provides " << workload.size();
     }
-    for (auto [idx, expectedType, actualType] : llvm::enumerate(
-             workgroupCount.getArgumentTypes(), workload.getTypes())) {
+    for (auto [idx, expectedType, actualType] :
+         llvm::enumerate(explicitArgs, workload.getTypes())) {
       if (expectedType != actualType) {
         return op->emitOpError()
                << "workload operand " << idx << " type mismatch; expected "
@@ -187,6 +192,20 @@ static LogicalResult verifyEscapingResources(Region &region,
   return success();
 }
 
+static void eraseStreamRegionResults(Region &region,
+                                     ArrayRef<unsigned> excludedResultIndices) {
+  for (auto &block : region.getBlocks()) {
+    auto yieldOp = dyn_cast<IREE::Stream::YieldOp>(block.getTerminator());
+    if (!yieldOp)
+      continue;
+    llvm::SmallVector<Value> newOperands;
+    for (auto i : llvm::reverse(excludedResultIndices)) {
+      yieldOp.getResourceOperandsMutable().erase(i);
+      yieldOp.getResourceOperandSizesMutable().erase(i);
+    }
+  }
+}
+
 // Computes the value access bits starting from |rootValue|.
 // Traverses the IR graph along tied ops but does not handle branches.
 static IREE::Util::ValueAccess computeValueAccess(Value rootValue) {
@@ -255,18 +274,314 @@ static IREE::Util::ValueAccess computeValueAccess(Value rootValue) {
   return access;
 }
 
-static void eraseStreamRegionResults(Region &region,
-                                     ArrayRef<unsigned> excludedResultIndices) {
-  for (auto &block : region.getBlocks()) {
-    auto yieldOp = dyn_cast<IREE::Stream::YieldOp>(block.getTerminator());
-    if (!yieldOp)
-      continue;
-    llvm::SmallVector<Value> newOperands;
-    for (auto i : llvm::reverse(excludedResultIndices)) {
-      yieldOp.getResourceOperandsMutable().erase(i);
-      yieldOp.getResourceOperandSizesMutable().erase(i);
-    }
+//===----------------------------------------------------------------------===//
+// custom<DispatchEntryPoints>($entry_points)
+//===----------------------------------------------------------------------===//
+
+static ParseResult parseDispatchEntryPoints(OpAsmParser &parser,
+                                            ArrayAttr &entryPointAttrsArray) {
+  SmallVector<Attribute> entryPointAttrs;
+  if (succeeded(parser.parseOptionalLBrace())) {
+    do {
+      SymbolRefAttr entryPointAttr;
+      if (failed(parser.parseAttribute(entryPointAttr)))
+        return failure();
+      entryPointAttrs.push_back(entryPointAttr);
+    } while (succeeded(parser.parseOptionalComma()));
+    if (failed(parser.parseRBrace()))
+      return failure();
+  } else {
+    SymbolRefAttr entryPointAttr;
+    if (failed(parser.parseAttribute(entryPointAttr)))
+      return failure();
+    entryPointAttrs.push_back(entryPointAttr);
   }
+  entryPointAttrsArray = parser.getBuilder().getArrayAttr(entryPointAttrs);
+  return success();
+}
+
+static void printDispatchEntryPoints(OpAsmPrinter &p, Operation *op,
+                                     ArrayAttr entryPointAttrs) {
+  if (entryPointAttrs.size() == 1) {
+    p.printAttribute(entryPointAttrs.getValue().front());
+  } else {
+    p << '{';
+    llvm::interleaveComma(entryPointAttrs, p.getStream(),
+                          [&](Attribute attr) { p.printAttribute(attr); });
+    p << '}';
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// custom<EncodedResourceOperands>(
+//     $resources, type($resources), $resource_sizes,
+//     $resource_encodings, $resource_encoding_dims)
+//===----------------------------------------------------------------------===//
+
+static ParseResult parseEncodedResourceOperands(
+    OpAsmParser &parser,
+    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &resources,
+    SmallVectorImpl<Type> &resourceTypes,
+    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &resourceSizes,
+    ArrayAttr &resourceEncodings,
+    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &resourceEncodingDims) {
+  SmallVector<Attribute> resourceEncodingAttrs;
+  do {
+    resources.emplace_back();
+    TypeAttr resourceEncoding;
+    if (failed(parser.parseOperand(resources.back())) ||
+        failed(parser.parseColon()) ||
+        failed(parser.parseAttribute(resourceEncoding)))
+      return failure();
+    resourceEncodingAttrs.push_back(resourceEncoding);
+    if (int64_t dynamicDimCount =
+            cast<ShapedType>(resourceEncoding.getValue()).getNumDynamicDims()) {
+      if (failed(parser.parseOperandList(resourceEncodingDims, dynamicDimCount,
+                                         AsmParser::Delimiter::Braces)))
+        return failure();
+    }
+    resourceTypes.emplace_back();
+    resourceSizes.emplace_back();
+    if (failed(parser.parseKeyword("in")) ||
+        failed(parseSizeAwareType(parser, resourceTypes.back(),
+                                  resourceSizes.back())))
+      return failure();
+  } while (succeeded(parser.parseOptionalComma()));
+  resourceEncodings = parser.getBuilder().getArrayAttr(resourceEncodingAttrs);
+  return success();
+}
+
+static void printEncodedResourceOperands(OpAsmPrinter &p, Operation *op,
+                                         ValueRange resources,
+                                         TypeRange resourceTypes,
+                                         ValueRange resourceSizes,
+                                         ArrayAttr resourceEncodings,
+                                         ValueRange resourceEncodingDims) {
+  p.increaseIndent();
+  p.printNewline();
+  llvm::interleave(
+      llvm::zip_equal(resources, resourceTypes, resourceSizes,
+                      resourceEncodings.getAsValueRange<TypeAttr>()),
+      [&](auto it) {
+        auto [resource, resourceType, resourceSize, resourceEncoding] = it;
+        p << resource;
+        p << " : ";
+        p << resourceEncoding;
+        if (int64_t dynamicDimCount =
+                cast<ShapedType>(resourceEncoding).getNumDynamicDims()) {
+          p << "{";
+          llvm::interleaveComma(
+              resourceEncodingDims.take_front(dynamicDimCount), p);
+          resourceEncodingDims =
+              resourceEncodingDims.drop_front(dynamicDimCount);
+          p << "}";
+        }
+        p << " in ";
+        p << resourceType;
+        p << "{";
+        p << resourceSize;
+        p << "}";
+      },
+      [&]() {
+        p << ",";
+        p.printNewline();
+      });
+  p.decreaseIndent();
+  p.printNewline();
+}
+
+//===----------------------------------------------------------------------===//
+// custom<ParameterGatherOperations>(
+//     $source_scope, $source_keys, $source_offsets,
+//     $target, type($target), $target_size, $target_offsets, $target_lengths)
+//===----------------------------------------------------------------------===//
+
+static ParseResult parseParameterGatherOperations(
+    OpAsmParser &parser, StringAttr &sourceScopeAttr, ArrayAttr &sourceKeysAttr,
+    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &sourceOffsets,
+    OpAsmParser::UnresolvedOperand &target, Type &targetType,
+    OpAsmParser::UnresolvedOperand &targetSize,
+    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &targetOffsets,
+    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &targetLengths) {
+  auto builder = parser.getBuilder();
+  SmallVector<Attribute> sourceKeyAttrs;
+  do {
+    StringAttr rowSourceScopeAttr;
+    StringAttr sourceKeyAttr;
+    OpAsmParser::UnresolvedOperand sourceOffset;
+    OpAsmParser::UnresolvedOperand targetOffset;
+    OpAsmParser::UnresolvedOperand targetLength;
+    OpAsmParser::UnresolvedOperand rowTarget;
+    Type rowTargetType;
+    OpAsmParser::UnresolvedOperand rowTargetSize;
+    if (failed(parseParameterReference(parser, rowSourceScopeAttr,
+                                       sourceKeyAttr)) ||
+        failed(parser.parseLSquare()) ||
+        failed(parser.parseOperand(sourceOffset)) ||
+        failed(parser.parseRSquare()) || failed(parser.parseArrow()) ||
+        failed(parser.parseOperand(rowTarget)) ||
+        failed(parser.parseLSquare()) ||
+        failed(parser.parseOperand(targetOffset)) ||
+        failed(parser.parseKeyword("for")) ||
+        failed(parser.parseOperand(targetLength)) ||
+        failed(parser.parseRSquare()) ||
+        failed(parser.parseColonType(rowTargetType)) ||
+        failed(parser.parseLBrace()) ||
+        failed(parser.parseOperand(rowTargetSize)) ||
+        failed(parser.parseRBrace())) {
+      return failure();
+    }
+    if (!targetType) {
+      sourceScopeAttr = rowSourceScopeAttr;
+      target = rowTarget;
+      targetType = rowTargetType;
+      targetSize = rowTargetSize;
+    } else if (rowSourceScopeAttr != sourceScopeAttr ||
+               rowTarget.name != target.name || rowTargetType != targetType ||
+               rowTargetSize.name != targetSize.name) {
+      return parser.emitError(
+          parser.getCurrentLocation(),
+          "each operation must use the same scope and target resource");
+    }
+    sourceKeyAttrs.push_back(sourceKeyAttr);
+    sourceOffsets.push_back(sourceOffset);
+    targetOffsets.push_back(targetOffset);
+    targetLengths.push_back(targetLength);
+  } while (succeeded(parser.parseOptionalComma()));
+  sourceKeysAttr = builder.getArrayAttr(sourceKeyAttrs);
+  return success();
+}
+
+static void printParameterGatherOperations(
+    OpAsmPrinter &p, Operation *op, StringAttr sourceScopeAttr,
+    ArrayAttr sourceKeysAttr, ValueRange sourceOffsets, Value target,
+    Type targetType, Value targetSize, ValueRange targetOffsets,
+    ValueRange targetLengths) {
+  p.increaseIndent();
+  p.printNewline();
+  llvm::interleave(
+      llvm::zip_equal(sourceKeysAttr.getAsRange<StringAttr>(), sourceOffsets,
+                      targetOffsets, targetLengths),
+      [&](std::tuple<StringAttr, Value, Value, Value> it) {
+        auto [sourceKeyAttr, sourceOffset, targetOffset, targetLength] = it;
+        printParameterReference(p, op, sourceScopeAttr, sourceKeyAttr);
+        p << "[";
+        p.printOperand(sourceOffset);
+        p << "] -> ";
+        p.printOperand(target);
+        p << "[";
+        p.printOperand(targetOffset);
+        p << " for ";
+        p.printOperand(targetLength);
+        p << "] : ";
+        p.printType(targetType);
+        p << "{";
+        p.printOperand(targetSize);
+        p << "}";
+      },
+      [&]() {
+        p << ',';
+        p.printNewline();
+      });
+  p.decreaseIndent();
+  p.printNewline();
+}
+
+//===----------------------------------------------------------------------===//
+// custom<ParameterScatterOperations>(
+//     $source, type($source), $source_size, $source_offsets, $source_lengths,
+//     $target_scope, $target_keys, $target_offsets)
+//===----------------------------------------------------------------------===//
+
+static ParseResult parseParameterScatterOperations(
+    OpAsmParser &parser, OpAsmParser::UnresolvedOperand &source,
+    Type &sourceType, OpAsmParser::UnresolvedOperand &sourceSize,
+    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &sourceOffsets,
+    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &sourceLengths,
+    StringAttr &targetScopeAttr, ArrayAttr &targetKeysAttr,
+    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &targetOffsets) {
+  auto builder = parser.getBuilder();
+  SmallVector<Attribute> targetKeyAttrs;
+  do {
+    OpAsmParser::UnresolvedOperand rowSource;
+    Type rowSourceType;
+    OpAsmParser::UnresolvedOperand rowSourceSize;
+    OpAsmParser::UnresolvedOperand sourceOffset;
+    OpAsmParser::UnresolvedOperand sourceLength;
+    StringAttr rowTargetScopeAttr;
+    StringAttr targetKeyAttr;
+    OpAsmParser::UnresolvedOperand targetOffset;
+    if (failed(parser.parseOperand(rowSource)) ||
+        failed(parser.parseLSquare()) ||
+        failed(parser.parseOperand(sourceOffset)) ||
+        failed(parser.parseKeyword("for")) ||
+        failed(parser.parseOperand(sourceLength)) ||
+        failed(parser.parseRSquare()) ||
+        failed(parser.parseColonType(rowSourceType)) ||
+        failed(parser.parseLBrace()) ||
+        failed(parser.parseOperand(rowSourceSize)) ||
+        failed(parser.parseRBrace()) || failed(parser.parseArrow()) ||
+        failed(parseParameterReference(parser, rowTargetScopeAttr,
+                                       targetKeyAttr)) ||
+        failed(parser.parseLSquare()) ||
+        failed(parser.parseOperand(targetOffset)) ||
+        failed(parser.parseRSquare())) {
+      return failure();
+    }
+    if (!sourceType) {
+      source = rowSource;
+      sourceType = rowSourceType;
+      sourceSize = rowSourceSize;
+      targetScopeAttr = rowTargetScopeAttr;
+    } else if (rowSource.name != source.name || rowSourceType != sourceType ||
+               rowSourceSize.name != sourceSize.name ||
+               rowTargetScopeAttr != targetScopeAttr) {
+      return parser.emitError(
+          parser.getCurrentLocation(),
+          "each operation must use the same source resource and scope");
+    }
+    sourceOffsets.push_back(sourceOffset);
+    sourceLengths.push_back(sourceLength);
+    targetKeyAttrs.push_back(targetKeyAttr);
+    targetOffsets.push_back(targetOffset);
+  } while (succeeded(parser.parseOptionalComma()));
+  targetKeysAttr = builder.getArrayAttr(targetKeyAttrs);
+  return success();
+}
+
+static void printParameterScatterOperations(
+    OpAsmPrinter &p, Operation *op, Value source, Type sourceType,
+    Value sourceSize, ValueRange sourceOffsets, ValueRange sourceLengths,
+    StringAttr targetScopeAttr, ArrayAttr targetKeysAttr,
+    ValueRange targetOffsets) {
+  p.increaseIndent();
+  p.printNewline();
+  llvm::interleave(
+      llvm::zip_equal(sourceOffsets, sourceLengths,
+                      targetKeysAttr.getAsRange<StringAttr>(), targetOffsets),
+      [&](std::tuple<Value, Value, StringAttr, Value> it) {
+        auto [sourceOffset, sourceLength, targetKeyAttr, targetOffset] = it;
+        p.printOperand(source);
+        p << "[";
+        p.printOperand(sourceOffset);
+        p << " for ";
+        p.printOperand(sourceLength);
+        p << "] : ";
+        p.printType(sourceType);
+        p << "{";
+        p.printOperand(sourceSize);
+        p << "} -> ";
+        printParameterReference(p, op, targetScopeAttr, targetKeyAttr);
+        p << "[";
+        p.printOperand(targetOffset);
+        p << "]";
+      },
+      [&]() {
+        p << ',';
+        p.printNewline();
+      });
+  p.decreaseIndent();
+  p.printNewline();
 }
 
 //===----------------------------------------------------------------------===//
@@ -615,22 +930,124 @@ static void printWorkgroupCountRegion(OpAsmPrinter &p, Operation *op,
 // stream.resource.alloc
 //===----------------------------------------------------------------------===//
 
-LogicalResult ResourceAllocOp::verify() {
-  ResourceAllocOp op = *this;
-  if (failed(verifyOpValueSizes(op, op.getResults(), op.getStorageSizes()))) {
-    return failure();
+// static
+std::pair<IREE::Stream::ResourceAllocOp, SmallVector<Value>>
+ResourceAllocOp::createSuballocations(
+    Type resourceType, ArrayRef<Location> locs, ValueRange storageSizes,
+    bool uninitialized, AffinityAttr affinityAttr, OpBuilder &builder) {
+  assert(locs.size() == storageSizes.size() &&
+         "expect locs and storageSizes to match");
+  if (locs.empty())
+    return {};
+  if (locs.size() == 1) {
+    auto allocOp = builder.create<IREE::Stream::ResourceAllocOp>(
+        locs.front(), resourceType, storageSizes.front(), uninitialized,
+        affinityAttr);
+    return {allocOp, {allocOp.getResult()}};
   }
+  auto fusedLoc = builder.getFusedLoc(locs);
 
-  // All allocated resources must have the same lifetime.
-  auto anyType = op.getResults().front().getType();
-  for (auto type : op.getResultTypes()) {
-    if (type != anyType) {
-      return op.emitError()
-             << "all allocated resources must have the same lifetime";
-    }
+  // NOTE: this is risky: we are assuming right now that all of the
+  // allocations will fit within the constraints of the system. This is not
+  // guaranteed: a very low maximum buffer range may lead to packed slabs
+  // that are not fully addressable. For now we are processing models with
+  // small enough workloads and our target devices are relatively lax on
+  // things so long as we stay under UINT32_MAX boundaries.
+
+  // All slices are 0-0 (overlapping).
+  size_t sliceCount = locs.size();
+  SmallVector<int64_t> lifetimeIntervals(sliceCount * 2, 0);
+
+  // Compute total size and the offsets of all suballocated resources via the
+  // pack op.
+  auto indexType = builder.getIndexType();
+  SmallVector<Type> packedOffsetTypes(sliceCount, indexType);
+  auto packOp = builder.create<IREE::Stream::ResourcePackOp>(
+      fusedLoc, indexType, packedOffsetTypes, /*offset=*/nullptr,
+      builder.getIndexArrayAttr(lifetimeIntervals), storageSizes, affinityAttr);
+
+  // Create the new alloca based on the total required size.
+  auto allocOp = builder.create<IREE::Stream::ResourceAllocOp>(
+      fusedLoc, resourceType, packOp.getTotalLength(), uninitialized,
+      affinityAttr);
+  auto slab = allocOp.getResult();
+  auto slabSize = packOp.getTotalLength();
+
+  // Create subviews for all of the suballocated resources.
+  SmallVector<Value> results;
+  for (auto [loc, subviewOffset, subviewLength] :
+       llvm::zip_equal(locs, packOp.getPackedOffsets(), storageSizes)) {
+    results.push_back(builder
+                          .create<IREE::Stream::ResourceSubviewOp>(
+                              loc, slab, slabSize, subviewOffset, subviewLength)
+                          .getResult());
   }
+  return {allocOp, results};
+}
 
-  return success();
+//===----------------------------------------------------------------------===//
+// stream.resource.alloca
+//===----------------------------------------------------------------------===//
+
+// static
+std::pair<IREE::Stream::ResourceAllocaOp, SmallVector<Value>>
+ResourceAllocaOp::createSuballocations(Type timepointType, Type resourceType,
+                                       ArrayRef<Location> locs,
+                                       ValueRange storageSizes,
+                                       Value awaitTimepoint,
+                                       AffinityAttr affinityAttr,
+                                       OpBuilder &builder) {
+  assert(locs.size() == storageSizes.size() &&
+         "expect locs and storageSizes to match");
+  if (locs.empty())
+    return {};
+  if (locs.size() == 1) {
+    auto allocaOp = builder.create<IREE::Stream::ResourceAllocaOp>(
+        locs.front(), resourceType, timepointType, storageSizes.front(),
+        awaitTimepoint, affinityAttr);
+    return {allocaOp, {allocaOp.getResult()}};
+  }
+  auto fusedLoc = builder.getFusedLoc(locs);
+
+  // NOTE: this is risky: we are assuming right now that all of the
+  // allocations will fit within the constraints of the system. This is not
+  // guaranteed: a very low maximum buffer range may lead to packed slabs
+  // that are not fully addressable. For now we are processing models with
+  // small enough workloads and our target devices are relatively lax on
+  // things so long as we stay under UINT32_MAX boundaries. If a user starts
+  // hitting this the solution is to do in-place outputs such that we don't
+  // need to allocate them; when possible that's always going to be better than
+  // leaving them to the IREE compiled program to deal with.
+
+  // All slices are 0-0 (overlapping).
+  size_t sliceCount = locs.size();
+  SmallVector<int64_t> lifetimeIntervals(sliceCount * 2, 0);
+
+  // Compute total size and the offsets of all suballocated resources via the
+  // pack op.
+  auto indexType = builder.getIndexType();
+  SmallVector<Type> packedOffsetTypes(sliceCount, indexType);
+  auto packOp = builder.create<IREE::Stream::ResourcePackOp>(
+      fusedLoc, indexType, packedOffsetTypes, /*offset=*/nullptr,
+      builder.getIndexArrayAttr(lifetimeIntervals), storageSizes, affinityAttr);
+
+  // Create the new alloca based on the total required size.
+  auto allocaOp = builder.create<IREE::Stream::ResourceAllocaOp>(
+      fusedLoc, resourceType, timepointType, packOp.getTotalLength(),
+      awaitTimepoint, affinityAttr);
+  auto slab = allocaOp.getResult();
+  auto slabSize = packOp.getTotalLength();
+
+  // Create subviews for all of the suballocated resources.
+  SmallVector<Value> results;
+  for (auto [loc, subviewOffset, subviewLength] :
+       llvm::zip_equal(locs, packOp.getPackedOffsets(), storageSizes)) {
+    results.push_back(builder
+                          .create<IREE::Stream::ResourceSubviewOp>(
+                              loc, slab, slabSize, subviewOffset, subviewLength)
+                          .getResult());
+  }
+  return {allocaOp, results};
 }
 
 //===----------------------------------------------------------------------===//
@@ -721,6 +1138,9 @@ LogicalResult ResourceConstantsOp::verify() {
   if (op.getResultSizes().size() != count || op.getValues().size() != count) {
     return op.emitOpError() << "mismatched constant/result counts";
   }
+  if (!llvm::all_equal(op.getResults().getTypes())) {
+    return op.emitOpError() << "all results must be of the same type";
+  }
   return success();
 }
 
@@ -777,6 +1197,74 @@ IREE::Stream::ResourceSubviewOp ResourceSubviewOp::findSubviewOp(Value value) {
     }
   }
   return {};
+}
+
+//===----------------------------------------------------------------------===//
+// stream.parameter.load
+//===----------------------------------------------------------------------===//
+
+//===----------------------------------------------------------------------===//
+// stream.parameter.read
+//===----------------------------------------------------------------------===//
+
+LogicalResult ParameterReadOp::verify() {
+  ParameterReadOp op = *this;
+  if (failed(verifyOpValueSizes(op, op.getTarget(), op.getTargetSize()))) {
+    return failure();
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// stream.parameter.write
+//===----------------------------------------------------------------------===//
+
+LogicalResult ParameterWriteOp::verify() {
+  ParameterWriteOp op = *this;
+  if (failed(verifyOpValueSizes(op, op.getSource(), op.getSourceSize()))) {
+    return failure();
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// stream.parameter.gather
+//===----------------------------------------------------------------------===//
+
+LogicalResult ParameterGatherOp::verify() {
+  ParameterGatherOp op = *this;
+  size_t expectedCount = op.getSourceKeys().size();
+  if (op.getSourceOffsets().size() != expectedCount ||
+      op.getTargetOffsets().size() != expectedCount ||
+      op.getTargetLengths().size() != expectedCount) {
+    return op.emitOpError()
+           << "requires that the source keys, source offsets, target offsets, "
+              "and target lengths are all 1:1";
+  }
+  if (failed(verifyOpValueSizes(op, op.getTarget(), op.getTargetSize()))) {
+    return failure();
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// stream.parameter.scatter
+//===----------------------------------------------------------------------===//
+
+LogicalResult ParameterScatterOp::verify() {
+  ParameterScatterOp op = *this;
+  size_t expectedCount = op.getTargetKeys().size();
+  if (op.getSourceOffsets().size() != expectedCount ||
+      op.getSourceLengths().size() != expectedCount ||
+      op.getTargetOffsets().size() != expectedCount) {
+    return op.emitOpError()
+           << "requires that the source offsets, source lengths, target keys, "
+              "and target offsets are all 1:1";
+  }
+  if (failed(verifyOpValueSizes(op, op.getSource(), op.getSourceSize()))) {
+    return failure();
+  }
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -957,7 +1445,8 @@ bool TensorSplatOp::preferCloneToConsumers() { return true; }
 
 LogicalResult TensorCloneOp::verify() {
   TensorCloneOp op = *this;
-  // Clones can't change encodings but they can change shape information.
+  // Clones can't change encodings but they can change shape and element type
+  // information.
   auto sourceEncoding = llvm::cast<RankedTensorType>(op.getSourceEncoding());
   auto resultEncoding = llvm::cast<RankedTensorType>(op.getResultEncoding());
   if (sourceEncoding.getEncoding() != resultEncoding.getEncoding()) {
@@ -1102,6 +1591,54 @@ TensorStoreOp::getTiedResultOperandIndex(unsigned resultIndex) {
 
 SmallVector<int64_t> TensorStoreOp::getTiedResultOperandIndices() {
   return {0}; // target
+}
+
+//===----------------------------------------------------------------------===//
+// stream.tensor.trace
+//===----------------------------------------------------------------------===//
+
+LogicalResult TensorTraceOp::verify() {
+  TensorTraceOp op = *this;
+  if (op.getResources().size() != op.getResourceEncodings().size() ||
+      op.getResources().size() != op.getResourceSizes().size()) {
+    return op.emitOpError(
+        "each resource needs a matching resource encoding and size "
+        "(array length mismatch)");
+  }
+  auto resourceEncodingDims = op.getResourceEncodingDims();
+  for (auto [resource, resourceSize, resourceEncoding] :
+       llvm::zip_equal(op.getResources(), op.getResourceSizes(),
+                       op.getResourceEncodings().getAsValueRange<TypeAttr>())) {
+    int64_t dynamicDimCount =
+        cast<ShapedType>(resourceEncoding).getNumDynamicDims();
+    if (failed(verifyOpDynamicDims(
+            op, resourceEncoding,
+            resourceEncodingDims.take_front(dynamicDimCount))) ||
+        failed(verifyOpValueSizes(op, resource, resourceSize))) {
+      return failure();
+    }
+    resourceEncodingDims = resourceEncodingDims.drop_front(dynamicDimCount);
+  }
+  return success();
+}
+
+ValueRange TensorTraceOp::getOperandDynamicDims(unsigned idx) {
+  auto resourceEncodings = getResourceEncodings().getValue();
+  auto resourceEncodingDims = getResourceEncodingDims();
+  for (unsigned i = 0; i <= idx; ++i) {
+    auto resourceEncoding = resourceEncodings[i].cast<TypeAttr>().getValue();
+    int64_t dynamicDimCount =
+        cast<ShapedType>(resourceEncoding).getNumDynamicDims();
+    if (i == idx) {
+      return resourceEncodingDims.take_front(dynamicDimCount);
+    }
+    resourceEncodingDims = resourceEncodingDims.drop_front(dynamicDimCount);
+  }
+  return ValueRange{};
+}
+
+ValueRange TensorTraceOp::getResultDynamicDims(unsigned idx) {
+  return ValueRange{};
 }
 
 //===----------------------------------------------------------------------===//
@@ -1557,26 +2094,32 @@ LogicalResult AsyncDispatchOp::verify() {
 LogicalResult
 AsyncDispatchOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   Operation *op = getOperation();
-  auto exportOp =
-      symbolTable.lookupNearestSymbolFrom<IREE::Stream::ExecutableExportOp>(
-          op, getEntryPoint());
-  if (!exportOp) {
-    // TODO(benvanik): there are a lot of tests that are assuming this is not
-    // verified. We'll need to go add dummy executables for all of them. Today
-    // we just bail on the verifier if the symbol isn't found.
-    //
-    // Should be:
-    //   return op->emitOpError() << "undefined entry point: " << entry_point();
-    return success();
+  auto entryPointRefs = getEntryPointRefs();
+  if (entryPointRefs.empty()) {
+    return emitOpError() << "at least one entry point must be defined";
   }
+  for (auto entryPointAttr : entryPointRefs) {
+    auto exportOp =
+        symbolTable.lookupNearestSymbolFrom<IREE::Stream::ExecutableExportOp>(
+            op, entryPointAttr);
+    if (!exportOp) {
+      // TODO(benvanik): there are a lot of tests that are assuming this is not
+      // verified. We'll need to go add dummy executables for all of them. Today
+      // we just bail on the verifier if the symbol isn't found.
+      //
+      // Should be:
+      //   return op->emitOpError() << "undefined entry point: " <<
+      //   entry_point();
+      return success();
+    }
 
-  // Verify that the workload parameters captured match the target export.
-  if (failed(verifyDispatchWorkload(op, exportOp, getWorkload()))) {
-    return failure();
+    // Verify that the workload parameters captured match the target export.
+    if (failed(verifyDispatchWorkload(op, exportOp, getWorkload()))) {
+      return failure();
+    }
+
+    // TODO(benvanik): verify that the target function has matching operands.
   }
-
-  // TODO(benvanik): verify that the target function has matching operands.
-
   return success();
 }
 
@@ -2256,40 +2799,6 @@ CmdDispatchOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   return success();
 }
 
-static ParseResult parseDispatchEntryPoints(OpAsmParser &parser,
-                                            ArrayAttr &entryPointAttrsArray) {
-  SmallVector<Attribute> entryPointAttrs;
-  if (succeeded(parser.parseOptionalLBrace())) {
-    do {
-      SymbolRefAttr entryPointAttr;
-      if (failed(parser.parseAttribute(entryPointAttr)))
-        return failure();
-      entryPointAttrs.push_back(entryPointAttr);
-    } while (succeeded(parser.parseOptionalComma()));
-    if (failed(parser.parseRBrace()))
-      return failure();
-  } else {
-    SymbolRefAttr entryPointAttr;
-    if (failed(parser.parseAttribute(entryPointAttr)))
-      return failure();
-    entryPointAttrs.push_back(entryPointAttr);
-  }
-  entryPointAttrsArray = parser.getBuilder().getArrayAttr(entryPointAttrs);
-  return success();
-}
-
-static void printDispatchEntryPoints(OpAsmPrinter &p, Operation *op,
-                                     ArrayAttr entryPointAttrs) {
-  if (entryPointAttrs.size() == 1) {
-    p.printAttribute(entryPointAttrs.getValue().front());
-  } else {
-    p << '{';
-    llvm::interleaveComma(entryPointAttrs, p.getStream(),
-                          [&](Attribute attr) { p.printAttribute(attr); });
-    p << '}';
-  }
-}
-
 static ParseResult parseDispatchResources(
     OpAsmParser &parser,
     SmallVectorImpl<OpAsmParser::UnresolvedOperand> &resources,
@@ -2947,6 +3456,23 @@ LogicalResult TimepointJoinOp::verify() {
   return success();
 }
 
+// static
+Value TimepointJoinOp::join(Location loc, ValueRange timepoints,
+                            OpBuilder &builder) {
+  assert(!timepoints.empty() && "must have at least one timepoint");
+  if (timepoints.size() == 1)
+    return timepoints.front();
+  return builder.create<IREE::Stream::TimepointJoinOp>(
+      loc, builder.getType<IREE::Stream::TimepointType>(), timepoints);
+}
+
+// static
+Value TimepointJoinOp::join(ValueRange timepoints, OpBuilder &builder) {
+  return join(builder.getFusedLoc(llvm::to_vector(llvm::map_range(
+                  timepoints, [](Value value) { return value.getLoc(); }))),
+              timepoints, builder);
+}
+
 //===----------------------------------------------------------------------===//
 // stream.timepoint.barrier
 //===----------------------------------------------------------------------===//
@@ -3104,8 +3630,10 @@ LogicalResult ExecutableExportOp::verify() {
       this->getOperation()->getParentOfType<IREE::Stream::ExecutableOp>();
   if (!executableOp)
     return {};
-  return executableOp.getInnerModule().lookupSymbol<::mlir::func::FuncOp>(
-      getFunctionRef());
+  auto innerModuleOp = executableOp.getInnerModule();
+  if (!innerModuleOp)
+    return {};
+  return innerModuleOp.lookupSymbol<::mlir::func::FuncOp>(getFunctionRef());
 }
 
 //===----------------------------------------------------------------------===//

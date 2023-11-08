@@ -5,7 +5,7 @@
 #executable_target_embedded_elf_x86_64_ = #hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {cpu_features = "", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128", native_vector_size = 16 : index, target_triple = "x86_64-none-elf"}>
 
 hal.executable private @pad_matmul_static_dispatch_0 {
-  hal.executable.variant public @embedded_elf_x86_64, target = #executable_target_embedded_elf_x86_64_ {
+  hal.executable.variant public @embedded_elf_x86_64 target(#executable_target_embedded_elf_x86_64_) {
     hal.executable.export public @pad_matmul_static_dispatch_0 ordinal(0) layout(#pipeline_layout)
     builtin.module {
       func.func @pad_matmul_static_dispatch_0() {
@@ -35,9 +35,11 @@ hal.executable private @pad_matmul_static_dispatch_0 {
   }
 }
 
-transform.sequence failures(propagate) {
-^bb1(%variant_op: !transform.any_op):
-  transform.iree.eliminate_empty_tensors %variant_op : (!transform.any_op) -> ()
-  %variant_op_3 = transform.iree.bufferize %variant_op : (!transform.any_op) -> (!transform.any_op)
-  %func = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!transform.any_op) -> !transform.any_op
-}
+module attributes { transform.with_named_sequence } {
+  transform.named_sequence @__transform_main(%variant_op: !transform.any_op {transform.consumed}) {
+    transform.iree.eliminate_empty_tensors %variant_op : (!transform.any_op) -> ()
+    %variant_op_3 = transform.iree.bufferize %variant_op : (!transform.any_op) -> (!transform.any_op)
+    %func = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!transform.any_op) -> !transform.any_op
+    transform.yield 
+  }
+} // module

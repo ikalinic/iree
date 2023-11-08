@@ -1,5 +1,4 @@
 // RUN: iree-compile --iree-hal-target-backends=vmvx %s | iree-check-module --device=local-task --module=-
-// RUN: [[ $IREE_VULKAN_DISABLE == 1 ]] || (iree-compile --iree-hal-target-backends=vulkan-spirv %s | iree-check-module --device=vulkan --module=-)
 
 func.func @expect_true() {
   %true = util.unfoldable_constant 1 : i32
@@ -14,9 +13,10 @@ func.func @expect_false() {
 }
 
 func.func @expect_all_true() {
+  %device = hal.ex.shared_device : !hal.device
   %all_true = util.unfoldable_constant dense<1> : tensor<2x2xi32>
   %all_true_view = hal.tensor.export %all_true : tensor<2x2xi32> -> !hal.buffer_view
-  check.expect_all_true(%all_true_view) : !hal.buffer_view
+  check.expect_all_true<%device>(%all_true_view) : !hal.buffer_view
   return
 }
 

@@ -9,6 +9,7 @@ RC_PFN_DECL(hipCtxCreate, hipCtx_t *, unsigned int, hipDevice_t)
 RC_PFN_DECL(hipCtxDestroy, hipCtx_t)
 RC_PFN_DECL(hipDeviceGet, hipDevice_t *, int)  // No direct, need to modify
 RC_PFN_DECL(hipGetDeviceCount, int *)
+RC_PFN_DECL(hipGetDeviceProperties, hipDeviceProp_t *, int)
 RC_PFN_DECL(hipDeviceGetName, char *, int,
             hipDevice_t)  // No direct, need to modify
 RC_PFN_STR_DECL(
@@ -54,5 +55,11 @@ RC_PFN_DECL(hipEventElapsedTime, float *, hipEvent_t, hipEvent_t)
 RC_PFN_DECL(hipEventQuery, hipEvent_t)
 RC_PFN_DECL(hipEventRecord, hipEvent_t, hipStream_t)
 RC_PFN_DECL(hipEventSynchronize, hipEvent_t)
-RC_PFN_DECL(hipDeviceGetUuid, hipUUID *, hipDevice_t)
 RC_PFN_DECL(hipMemcpyHtoD, hipDeviceptr_t, void *, size_t)
+RC_PFN_DECL(hipDeviceGetAttribute, int *, hipDeviceAttribute_t, int)
+RC_PFN_DECL(hipFuncSetAttribute, const void *, hipFuncAttribute, int)
+RC_PFN_DECL(hipDeviceGetUuid, hipUUID *, hipDevice_t)
+RC_PFN_DECL(hipDevicePrimaryCtxRetain, hipCtx_t *, hipDevice_t)
+RC_PFN_DECL(hipCtxGetDevice, hipDevice_t *)
+RC_PFN_DECL(hipCtxSetCurrent, hipCtx_t)
+RC_PFN_DECL(hipDevicePrimaryCtxRelease, hipDevice_t)

@@ -1,8 +1,10 @@
-// RUN: iree-opt %s --pass-pipeline="builtin.module(hal.executable(iree-transform-dialect-interpreter{transform-file-name=%p/transform_dialect_codegen_vector_warp_execute_on_lane_0_spec.mlir}))" \
+// RUN: iree-opt %s --pass-pipeline="builtin.module(hal.executable(iree-transform-dialect-interpreter))" \
+// RUN: --iree-codegen-transform-dialect-library=%p/transform_dialect_codegen_vector_warp_execute_on_lane_0_spec.mlir \
 // RUN: --allow-unregistered-dialect | \
 // RUN: FileCheck %s --check-prefix=WARP-EXECUTE
 
-// RUN: iree-opt %s --pass-pipeline="builtin.module(hal.executable(iree-transform-dialect-interpreter{transform-file-name=%p/transform_dialect_codegen_vector_distribution_spec.mlir}))" \
+// RUN: iree-opt %s --pass-pipeline="builtin.module(hal.executable(iree-transform-dialect-interpreter))" \
+// RUN: --iree-codegen-transform-dialect-library=%p/transform_dialect_codegen_vector_distribution_spec.mlir \
 // RUN: --allow-unregistered-dialect | \
 // RUN: FileCheck %s
 
@@ -10,7 +12,7 @@
 #executable_target_cuda_nvptx_fb = #hal.executable.target<"cuda", "cuda-nvptx-fb", {target_arch = "sm_60"}>
 
 hal.executable private @reduce_dispatch_0 {
-  hal.executable.variant public @cuda_nvptx_fb, target = #executable_target_cuda_nvptx_fb {
+  hal.executable.variant public @cuda_nvptx_fb target(#executable_target_cuda_nvptx_fb) {
     hal.executable.export public @reduce_dispatch_0 ordinal(0) layout(#pipeline_layout) attributes { workgroup_size = [64: index, 1: index, 1: index], subgroup_size = 32 : index }
     builtin.module {
       func.func @reduce_dispatch_0() {
