@@ -246,12 +246,15 @@ static iree_status_t iree_hal_rocm_direct_command_buffer_update_buffer(
   hipDeviceptr_t target_device_buffer = iree_hal_rocm_buffer_device_pointer(
       iree_hal_buffer_allocated_buffer(target_buffer));
 
-  hipDeviceptr_t dst = target_device_buffer +
+  hipDeviceptr_t dst =
+      (hipDeviceptr_t)((uintptr_t)target_device_buffer +
                        iree_hal_buffer_byte_offset(target_buffer) +
-                       target_offset;
+                       target_offset);
 
-  ROCM_RETURN_IF_ERROR(command_buffer->context->syms,
-                       hipMemcpyHtoD(dst, src, length), "hipMemcpyHtoD");
+  ROCM_RETURN_IF_ERROR(
+      command_buffer->context->syms,
+      hipMemcpyHtoDAsync(dst, (void*)src, length, 0),
+      "hipMemcpyAsync");
 
   return iree_ok_status();
 }
