@@ -140,6 +140,7 @@ static iree_status_t iree_hal_rocm_device_create_internal(
   }
   if (iree_status_is_ok(status)) {
     status = iree_hal_rocm_allocator_create(&device->context_wrapper,
+                                            device->device, device->stream,
                                             &device->device_allocator);
   }
   if (iree_status_is_ok(status)) {
@@ -438,7 +439,7 @@ static iree_status_t iree_hal_rocm_device_queue_execute(
       iree_hal_rocm_tracing_context_collect(device->tracing_context);
       IREE_TRACE_ZONE_END(z0);
       return iree_ok_status();
-    } 
+    }
   }
   IREE_TRACE_ZONE_BEGIN_NAMED(z0, "hipStreamSynchronize");
   ROCM_RETURN_IF_ERROR(device->context_wrapper.syms,
