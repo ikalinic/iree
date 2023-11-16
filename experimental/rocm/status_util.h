@@ -33,6 +33,20 @@ extern "C" {
                                                       __FILE__, __LINE__),    \
                        __VA_ARGS__)
 
+
+// IREE_RETURN_IF_ERROR but ends the current zone and implicitly converts the
+// hipStatus_t return value to an iree_status_t.
+//
+// Usage:
+//   IREE_ROCM_RETURN_AND_END_ZONE_IF_ERROR(zone_id, rocm_symbols,
+//                                          hipDoThing(...), "message");
+#define IREE_ROCM_RETURN_AND_END_ZONE_IF_ERROR(zone_id, syms, expr, ...) \
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(                                     \
+      zone_id,                                                           \
+      iree_hal_rocm_result_to_status((syms), ((syms)->expr), __FILE__,  \
+                                      __LINE__),                         \
+      __VA_ARGS__)
+
 // IREE_IGNORE_ERROR but implicitly converts the hipError_t return value to a
 // Status.
 //

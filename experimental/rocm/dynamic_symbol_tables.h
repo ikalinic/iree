@@ -25,6 +25,7 @@ RC_PFN_STR_DECL(
                  // const char* instead of hipError_t so it uses a different
                  // macro
 RC_PFN_DECL(hipInit, unsigned int)
+RC_PFN_DECL(hipLaunchHostFunc, hipStream_t, hipHostFn_t, void *)
 RC_PFN_DECL(hipModuleLaunchKernel, hipFunction_t, unsigned int, unsigned int,
             unsigned int, unsigned int, unsigned int, unsigned int,
             unsigned int, hipStream_t, void **, void **)
@@ -69,9 +70,14 @@ RC_PFN_DECL(hipCtxSetCurrent, hipCtx_t)
 RC_PFN_DECL(hipDevicePrimaryCtxRelease, hipDevice_t)
 RC_PFN_DECL(hipGraphDestroy, hipGraph_t)
 RC_PFN_DECL(hipGraphExecDestroy, hipGraphExec_t)
-RC_PFN_DECL(hipGraphAddMemsetNode, hipGraphNode_t *, hipGraph_t, const hipGraphNode_t *, size_t, const hipMemsetParams *)
-RC_PFN_DECL(hipGraphAddMemcpyNode1D, hipGraphNode_t *, hipGraph_t, const hipGraphNode_t *, size_t, void *, const void *, size_t, hipMemcpyKind)
-RC_PFN_DECL(hipGraphAddKernelNode, hipGraphNode_t *, hipGraph_t, const hipGraphNode_t *, size_t, const hipKernelNodeParams *)
-RC_PFN_DECL(hipGraphInstantiate, hipGraphExec_t *, hipGraph_t, hipGraphNode_t *, char *, size_t)
+RC_PFN_DECL(hipGraphAddMemsetNode, hipGraphNode_t *, hipGraph_t,
+            const hipGraphNode_t *, size_t, const hipMemsetParams *)
+RC_PFN_DECL(hipGraphAddMemcpyNode1D, hipGraphNode_t *, hipGraph_t,
+            const hipGraphNode_t *, size_t, void *, const void *, size_t,
+            hipMemcpyKind)
+RC_PFN_DECL(hipGraphAddKernelNode, hipGraphNode_t *, hipGraph_t,
+            const hipGraphNode_t *, size_t, const hipKernelNodeParams *)
+RC_PFN_DECL(hipGraphInstantiate, hipGraphExec_t *, hipGraph_t, hipGraphNode_t *,
+            char *, size_t)
 RC_PFN_DECL(hipGraphLaunch, hipGraphExec_t, hipStream_t)
 RC_PFN_DECL(hipGraphCreate, hipGraph_t *, unsigned int)
