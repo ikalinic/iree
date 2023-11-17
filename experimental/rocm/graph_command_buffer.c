@@ -4,7 +4,6 @@
 
 #include "experimental/rocm/graph_command_buffer.h"
 
-#include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -18,10 +17,6 @@
 #include "iree/base/api.h"
 #include "iree/hal/utils/collective_batch.h"
 #include "iree/hal/utils/resource_set.h"
-
-#define IREE_HAL_ROCM_MAX_BINDING_COUNT 64
-// Kernel arguments contains binding and push constants.
-#define IREE_HAL_ROCM_MAX_KERNEL_ARG 128
 
 // Command buffer implementation that directly maps to rocm graph.
 // This records the commands on the calling thread without additional threading
@@ -39,8 +34,8 @@ typedef struct iree_hal_rocm_graph_command_buffer_t {
   // asynchronous operations.
   iree_arena_allocator_t arena;
 
-  hipGraph_t graph;
-  hipGraphExec_t exec;
+  hipGraph_t hip_graph;
+  hipGraphExec_t hip_graph_exec;
 
   // Keep track of the last node added to the command buffer as we are currently
   // serializing all the nodes (each node depends on the previous one).
@@ -49,10 +44,14 @@ typedef struct iree_hal_rocm_graph_command_buffer_t {
   // Iteratively constructed batch of collective operations.
   iree_hal_collective_batch_t collective_batch;
 
-  int32_t push_constant[IREE_HAL_ROCM_MAX_PUSH_CONSTANT_COUNT];
+  int32_t push_constants[IREE_HAL_ROCM_MAX_PUSH_CONSTANT_COUNT];
 
-  // Keep track of the current set of kernel arguments.
-  void* current_descriptor[];
+  // // Keep track of the current set of kernel arguments.
+  // void* current_descriptor[];
+  // The current bound descriptor sets.
+  struct {
+    hipDeviceptr_t bindings[IREE_HAL_ROCM_MAX_DESCRIPTOR_SET_BINDING_COUNT];
+  } descriptor_sets[IREE_HAL_ROCM_MAX_DESCRIPTOR_SET_COUNT];
 } iree_hal_rocm_graph_command_buffer_t;
 
 static const iree_hal_command_buffer_vtable_t
@@ -85,27 +84,17 @@ iree_status_t iree_hal_rocm_graph_command_buffer_create(
   IREE_TRACE_ZONE_BEGIN(z0);
 
   iree_hal_rocm_graph_command_buffer_t* command_buffer = NULL;
-  size_t total_size = sizeof(*command_buffer) +
-                      IREE_HAL_ROCM_MAX_KERNEL_ARG * sizeof(void*) +
-                      IREE_HAL_ROCM_MAX_KERNEL_ARG * sizeof(hipDeviceptr_t);
   iree_status_t status = iree_allocator_malloc(
-      context->host_allocator, total_size, (void**)&command_buffer);
+      context->host_allocator, sizeof(*command_buffer), (void**)&command_buffer);
   if (iree_status_is_ok(status)) {
     iree_hal_command_buffer_initialize(
         device, mode, command_categories, queue_affinity, binding_capacity,
         &iree_hal_rocm_graph_command_buffer_vtable, &command_buffer->base);
     command_buffer->context = context;
     iree_arena_initialize(block_pool, &command_buffer->arena);
-    command_buffer->graph = NULL;
-    command_buffer->exec = NULL;
+    command_buffer->hip_graph = NULL;
+    command_buffer->hip_graph_exec = NULL;
     command_buffer->last_node = NULL;
-
-    hipDeviceptr_t* device_ptrs =
-        (hipDeviceptr_t*)(command_buffer->current_descriptor +
-                          IREE_HAL_ROCM_MAX_KERNEL_ARG);
-    for (size_t i = 0; i < IREE_HAL_ROCM_MAX_KERNEL_ARG; i++) {
-      command_buffer->current_descriptor[i] = &device_ptrs[i];
-    }
 
     status = iree_hal_resource_set_allocate(block_pool,
                                             &command_buffer->resource_set);
@@ -134,15 +123,15 @@ static void iree_hal_rocm_graph_command_buffer_destroy(
   // Drop any pending collective batches before we tear things down.
   iree_hal_collective_batch_clear(&command_buffer->collective_batch);
 
-  if (command_buffer->graph != NULL) {
+  if (command_buffer->hip_graph != NULL) {
     ROCM_IGNORE_ERROR(command_buffer->context->syms,
-                      hipGraphDestroy(command_buffer->graph));
-    command_buffer->graph = NULL;
+                      hipGraphDestroy(command_buffer->hip_graph));
+    command_buffer->hip_graph = NULL;
   }
-  if (command_buffer->exec != NULL) {
+  if (command_buffer->hip_graph_exec != NULL) {
     ROCM_IGNORE_ERROR(command_buffer->context->syms,
-                      hipGraphExecDestroy(command_buffer->exec));
-    command_buffer->exec = NULL;
+                      hipGraphExecDestroy(command_buffer->hip_graph_exec));
+    command_buffer->hip_graph_exec = NULL;
   }
   command_buffer->last_node = NULL;
 
@@ -159,7 +148,7 @@ hipGraphExec_t iree_hal_rocm_graph_command_buffer_handle(
   if (!iree_hal_rocm_graph_command_buffer_isa(base_command_buffer)) return NULL;
   iree_hal_rocm_graph_command_buffer_t* command_buffer =
       iree_hal_rocm_graph_command_buffer_cast(base_command_buffer);
-  return command_buffer->exec;
+  return command_buffer->hip_graph_exec;
 }
 
 bool iree_hal_rocm_graph_command_buffer_isa(
@@ -215,14 +204,14 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_begin(
       iree_hal_rocm_graph_command_buffer_cast(base_command_buffer);
 
   // Fail if re-recording.
-  if (command_buffer->graph != NULL) {
+  if (command_buffer->hip_graph != NULL) {
     return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
                             "command buffer cannot be re-recorded");
   }
 
   // Create a new empty graph to record into.
   ROCM_RETURN_IF_ERROR(command_buffer->context->syms,
-                       hipGraphCreate(&command_buffer->graph, /*flags=*/0),
+                       hipGraphCreate(&command_buffer->hip_graph, /*flags=*/0),
                        "hipGraphCreate");
 
   return iree_ok_status();
@@ -244,15 +233,15 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_end(
   hipGraphNode_t error_node = NULL;
   iree_status_t status = ROCM_RESULT_TO_STATUS(
       command_buffer->context->syms,
-      hipGraphInstantiate(&command_buffer->exec, command_buffer->graph,
-                          &error_node,
+      hipGraphInstantiate(&command_buffer->hip_graph_exec,
+                          command_buffer->hip_graph, &error_node,
                           /*logBuffer=*/NULL,
                           /*bufferSize=*/0));
   if (iree_status_is_ok(status)) {
     // No longer need the source graph used for construction.
     ROCM_IGNORE_ERROR(command_buffer->context->syms,
-                      hipGraphDestroy(command_buffer->graph));
-    command_buffer->graph = NULL;
+                      hipGraphDestroy(command_buffer->hip_graph));
+    command_buffer->hip_graph = NULL;
   }
 
   iree_hal_resource_set_freeze(command_buffer->resource_set);
@@ -400,8 +389,8 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_fill_buffer(
   size_t numNode = command_buffer->last_node ? 1 : 0;
   ROCM_RETURN_IF_ERROR(
       command_buffer->context->syms,
-      hipGraphAddMemsetNode(&command_buffer->last_node, command_buffer->graph,
-                            dep, numNode, &params),
+      hipGraphAddMemsetNode(&command_buffer->last_node,
+                            command_buffer->hip_graph, dep, numNode, &params),
       "hipGraphAddMemsetNode");
 
   return iree_ok_status();
@@ -443,9 +432,9 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_update_buffer(
 
   ROCM_RETURN_IF_ERROR(
       command_buffer->context->syms,
-      hipGraphAddMemcpyNode1D(&command_buffer->last_node, command_buffer->graph,
-                              dep, numNode, dst, storage, length,
-                              hipMemcpyHostToDevice),
+      hipGraphAddMemcpyNode1D(&command_buffer->last_node,
+                              command_buffer->hip_graph, dep, numNode, dst,
+                              storage, length, hipMemcpyHostToDevice),
       "hipGraphAddMemcpyNode1D");
 
   return iree_ok_status();
@@ -487,9 +476,9 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_copy_buffer(
 
   ROCM_RETURN_IF_ERROR(
       command_buffer->context->syms,
-      hipGraphAddMemcpyNode1D(&command_buffer->last_node, command_buffer->graph,
-                              dep, numNode, dst, src, length,
-                              hipMemcpyDeviceToDevice),
+      hipGraphAddMemcpyNode1D(&command_buffer->last_node,
+                              command_buffer->hip_graph, dep, numNode, dst, src,
+                              length, hipMemcpyDeviceToDevice),
       "hipGraphAddMemcpyNode1D");
 
   return iree_ok_status();
@@ -515,25 +504,10 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_push_constants(
       iree_hal_rocm_graph_command_buffer_cast(base_command_buffer);
   iree_host_size_t constant_base_index = offset / sizeof(int32_t);
   for (iree_host_size_t i = 0; i < values_length / sizeof(int32_t); i++) {
-    command_buffer->push_constant[i + constant_base_index] =
+    command_buffer->push_constants[i + constant_base_index] =
         ((uint32_t*)values)[i];
   }
   return iree_ok_status();
-}
-
-// Tie together the binding index and its index in |bindings| array.
-typedef struct {
-  uint32_t index;
-  uint32_t binding;
-} iree_hal_rocm_binding_mapping_t;
-
-// Helper to sort the binding based on their binding index.
-static int compare_binding_index(const void* a, const void* b) {
-  const iree_hal_rocm_binding_mapping_t buffer_a =
-      *(const iree_hal_rocm_binding_mapping_t*)a;
-  const iree_hal_rocm_binding_mapping_t buffer_b =
-      *(const iree_hal_rocm_binding_mapping_t*)b;
-  return buffer_a.binding < buffer_b.binding ? -1 : 1;
 }
 
 static iree_status_t iree_hal_rocm_graph_command_buffer_push_descriptor_set(
@@ -541,47 +515,38 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_push_descriptor_set(
     iree_hal_pipeline_layout_t* pipeline_layout, uint32_t set,
     iree_host_size_t binding_count,
     const iree_hal_descriptor_set_binding_t* bindings) {
+  if (binding_count > IREE_HAL_ROCM_MAX_DESCRIPTOR_SET_BINDING_COUNT) {
+    return iree_make_status(
+        IREE_STATUS_RESOURCE_EXHAUSTED,
+        "exceeded available binding slots for push "
+        "descriptor set #%" PRIu32 "; requested %" PRIhsz " vs. maximal %d",
+        set, binding_count, IREE_HAL_ROCM_MAX_DESCRIPTOR_SET_BINDING_COUNT);
+  }
+
   iree_hal_rocm_graph_command_buffer_t* command_buffer =
       iree_hal_rocm_graph_command_buffer_cast(base_command_buffer);
+  IREE_TRACE_ZONE_BEGIN(z0);
 
-  iree_host_size_t base_binding =
-      iree_hal_rocm_base_binding_index(pipeline_layout, set);
-
-  // Convention with the compiler side. We map bindings to kernel argument.
-  // We compact the bindings to get a dense set of arguments and keep them order
-  // based on the binding index.
-  // Sort the binding based on the binding index and map the array index to the
-  // argument index.
-  iree_hal_rocm_binding_mapping_t binding_used[IREE_HAL_ROCM_MAX_BINDING_COUNT];
+  hipDeviceptr_t* current_bindings =
+      command_buffer->descriptor_sets[set].bindings;
   for (iree_host_size_t i = 0; i < binding_count; i++) {
-    iree_hal_rocm_binding_mapping_t buffer = {i, bindings[i].binding};
-    binding_used[i] = buffer;
-  }
-  // TODO: remove this sort - it's thankfully small (1-8 on average) but we
-  // should be able to avoid it like we do on the CPU side with a bitmap.
-  qsort(binding_used, binding_count, sizeof(iree_hal_rocm_binding_mapping_t),
-        compare_binding_index);
-  IREE_ASSERT_LT(binding_count, IREE_HAL_ROCM_MAX_BINDING_COUNT,
-                 "binding count larger than the max expected");
+    const iree_hal_descriptor_set_binding_t* binding = &bindings[i];
+    hipDeviceptr_t device_ptr = 0;
+    if (binding->buffer) {
+      IREE_RETURN_AND_END_ZONE_IF_ERROR(
+          z0, iree_hal_resource_set_insert(command_buffer->resource_set, 1,
+                                           &binding->buffer));
 
-  for (iree_host_size_t i = 0; i < binding_count; i++) {
-    iree_hal_descriptor_set_binding_t binding = bindings[binding_used[i].index];
-    hipDeviceptr_t device_ptr =
-        binding.buffer
-            ? (hipDeviceptr_t)((uintptr_t)iree_hal_rocm_buffer_device_pointer(
-                                   iree_hal_buffer_allocated_buffer(
-                                       binding.buffer)) +
-                               iree_hal_buffer_byte_offset(binding.buffer) +
-                               binding.offset)
-            : 0;
-    *((hipDeviceptr_t*)command_buffer->current_descriptor[i + base_binding]) =
-        device_ptr;
-    if (binding.buffer) {
-      IREE_RETURN_IF_ERROR(iree_hal_resource_set_insert(
-          command_buffer->resource_set, 1, &binding.buffer));
+      hipDeviceptr_t device_buffer = iree_hal_rocm_buffer_device_pointer(
+          iree_hal_buffer_allocated_buffer(binding->buffer));
+      iree_device_size_t offset = iree_hal_buffer_byte_offset(binding->buffer);
+      device_ptr = (hipDeviceptr_t)((uintptr_t*)device_buffer + offset +
+                                    binding->offset);
     }
+    current_bindings[binding->binding] = device_ptr;
   }
 
+  IREE_TRACE_ZONE_END(z0);
   return iree_ok_status();
 }
 
@@ -591,27 +556,79 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_dispatch(
     uint32_t workgroup_x, uint32_t workgroup_y, uint32_t workgroup_z) {
   iree_hal_rocm_graph_command_buffer_t* command_buffer =
       iree_hal_rocm_graph_command_buffer_cast(base_command_buffer);
-  IREE_RETURN_IF_ERROR(
-      iree_hal_rocm_graph_command_buffer_flush_collectives(command_buffer));
+  IREE_TRACE_ZONE_BEGIN(z0);
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, iree_hal_rocm_graph_command_buffer_flush_collectives(command_buffer));
 
   // Lookup kernel parameters used for side-channeling additional launch
   // information from the compiler.
   iree_hal_rocm_kernel_params_t kernel_params;
-  IREE_RETURN_IF_ERROR(
-      iree_hal_rocm_native_executable_entry_point_kernel_params(
-          executable, entry_point, &kernel_params));
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, iree_hal_rocm_native_executable_entry_point_kernel_params(
+              executable, entry_point, &kernel_params));
 
-  IREE_RETURN_IF_ERROR(iree_hal_resource_set_insert(
-      command_buffer->resource_set, 1, &executable));
-
-  // Patch the push constants in the kernel arguments.
-  iree_host_size_t num_constants =
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, iree_hal_resource_set_insert(command_buffer->resource_set, 1,
+                                       &executable));
+  // The total number of descriptors across all descriptor sets.
+  iree_host_size_t descriptor_count =
+      iree_hal_rocm_pipeline_layout_total_binding_count(kernel_params.layout);
+  // The total number of push constants.
+  iree_host_size_t push_constant_count =
       iree_hal_rocm_pipeline_layout_num_constants(kernel_params.layout);
-  iree_host_size_t constant_base_index =
+  // We append push constants to the end of descriptors to form a linear chain
+  // of kernel arguments.
+  iree_host_size_t kernel_params_count = descriptor_count + push_constant_count;
+  iree_host_size_t kernel_params_length = kernel_params_count * sizeof(void*);
+
+  // Per CUDA API requirements, we need two levels of indirection for passing
+  // kernel arguments in.
+  //   "If the kernel has N parameters, then kernelParams needs to be an array
+  //   of N pointers. Each pointer, from kernelParams[0] to kernelParams[N-1],
+  //   points to the region of memory from which the actual parameter will be
+  //   copied."
+  //
+  // (From the cuGraphAddKernelNode API doc in
+  // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GRAPH.html#group__CUDA__GRAPH_1g50d871e3bd06c1b835e52f2966ef366b)
+  //
+  // It means each kernel_params[i] is itself a pointer to the corresponding
+  // element at the *second* inline allocation at the end of the current
+  // segment.
+  iree_host_size_t total_size = kernel_params_length * 2;
+  uint8_t* storage_base = NULL;
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, iree_arena_allocate(&command_buffer->arena, total_size,
+                              (void**)&storage_base));
+  void** params_ptr = (void**)storage_base;
+
+  // Set up kernel arguments to point to the payload slots.
+  hipDeviceptr_t* payload_ptr =
+      (hipDeviceptr_t*)((uint8_t*)params_ptr + kernel_params_length);
+  for (size_t i = 0; i < kernel_params_count; i++) {
+    params_ptr[i] = &payload_ptr[i];
+  }
+
+  // Copy descriptors from all sets to the end of the current segment for later
+  // access.
+  iree_host_size_t set_count =
+      iree_hal_rocm_pipeline_layout_descriptor_set_count(kernel_params.layout);
+  for (iree_host_size_t i = 0; i < set_count; ++i) {
+    iree_host_size_t binding_count =
+        iree_hal_rocm_descriptor_set_layout_binding_count(
+            iree_hal_rocm_pipeline_layout_descriptor_set_layout(
+                kernel_params.layout, i));
+    iree_host_size_t index = iree_hal_rocm_base_binding_index(
+        kernel_params.layout, i);
+    memcpy(payload_ptr + index, command_buffer->descriptor_sets[i].bindings,
+           binding_count * sizeof(hipDeviceptr_t));
+  }
+
+  // Append the push constants to the kernel arguments.
+  iree_host_size_t base_index =
       iree_hal_rocm_push_constant_index(kernel_params.layout);
-  for (iree_host_size_t i = 0; i < num_constants; i++) {
-    *((uint32_t*)command_buffer->current_descriptor[i + constant_base_index]) =
-        command_buffer->push_constant[i];
+  for (iree_host_size_t i = 0; i < push_constant_count; i++) {
+    *((uint32_t*)params_ptr[base_index + i]) =
+        command_buffer->push_constants[i];
   }
 
   hipKernelNodeParams params = {
@@ -628,7 +645,7 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_dispatch(
               .y = workgroup_y,
               .z = workgroup_z,
           },
-      .kernelParams = command_buffer->current_descriptor,
+      .kernelParams = params_ptr,
       .sharedMemBytes = kernel_params.shared_memory_size,
   };
 
@@ -638,8 +655,8 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_dispatch(
 
   ROCM_RETURN_IF_ERROR(
       command_buffer->context->syms,
-      hipGraphAddKernelNode(&command_buffer->last_node, command_buffer->graph,
-                            dep, numNodes, &params),
+      hipGraphAddKernelNode(&command_buffer->last_node,
+                            command_buffer->hip_graph, dep, numNodes, &params),
       "hipGraphAddKernelNode");
 
   return iree_ok_status();
@@ -691,6 +708,5 @@ static const iree_hal_command_buffer_vtable_t
         .dispatch = iree_hal_rocm_graph_command_buffer_dispatch,
         .dispatch_indirect =
             iree_hal_rocm_graph_command_buffer_dispatch_indirect,
-        .execute_commands = 
-            iree_hal_rocm_graph_command_buffer_execute_commands,
+        .execute_commands = iree_hal_rocm_graph_command_buffer_execute_commands,
 };
