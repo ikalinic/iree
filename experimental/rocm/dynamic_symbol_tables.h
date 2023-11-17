@@ -82,3 +82,4 @@ RC_PFN_DECL(hipGraphInstantiate, hipGraphExec_t *, hipGraph_t, hipGraphNode_t *,
 RC_PFN_DECL(hipGraphLaunch, hipGraphExec_t, hipStream_t)
 RC_PFN_DECL(hipGraphCreate, hipGraph_t *, unsigned int)
 RC_PFN_DECL(hipGraphAddMemcpyNode, hipGraphNode_t *, hipGraph_t, const hipGraphNode_t *, size_t, const hipMemcpy3DParms *)
+RC_PFN_DECL(hipGraphAddEmptyNode, hipGraphNode_t *, hipGraph_t, const hipGraphNode_t *, size_t)
