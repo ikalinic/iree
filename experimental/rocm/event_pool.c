@@ -20,25 +20,26 @@
 //===----------------------------------------------------------------------===//
 
 struct iree_hal_rocm_event_t {
-  // The allocator used to create the event.
-  iree_allocator_t host_allocator;
-  // The symbols used to create and destroy hipEvent_t objects.
-  iree_hal_rocm_dynamic_symbols_t* symbols;
-
-  // The event pool that owns this event. This cannot be NULL.
-  iree_hal_rocm_event_pool_t* pool;
-  // The underlying hipEvent_t object.
-  hipEvent_t hip_event;
-
   // A reference count used to manage resource lifetime. Its value range:
   // * 1 - when inside the event pool and to be acquired;
   // * >= 1 - when acquired outside of the event pool;
   // * 0 - when before releasing back to the pool or destruction.
   iree_atomic_ref_count_t ref_count;
+
+  // The allocator used to create the event.
+  iree_allocator_t host_allocator;
+  // The symbols used to create and destroy hipEvent_t objects.
+  iree_hal_rocm_dynamic_symbols_t* symbols;
+
+  // The event pool that owns this event. This cannot be NULL. We retain it to
+  // make sure the event outlive the pool.
+  iree_hal_rocm_event_pool_t* pool;
+  // The underlying hipEvent_t object.
+  hipEvent_t cu_event;
 };
 
 hipEvent_t iree_hal_rocm_event_handle(const iree_hal_rocm_event_t* event) {
-  return event->hip_event;
+  return event->cu_event;
 }
 
 static inline void iree_hal_rocm_event_destroy(iree_hal_rocm_event_t* event) {
@@ -47,7 +48,7 @@ static inline void iree_hal_rocm_event_destroy(iree_hal_rocm_event_t* event) {
   IREE_TRACE_ZONE_BEGIN(z0);
 
   IREE_ASSERT_REF_COUNT_ZERO(&event->ref_count);
-  ROCM_IGNORE_ERROR(symbols, hipEventDestroy(event->hip_event));
+  ROCM_IGNORE_ERROR(symbols, hipEventDestroy(event->cu_event));
   iree_allocator_free(host_allocator, event);
 
   IREE_TRACE_ZONE_END(z0);
@@ -67,15 +68,15 @@ static inline iree_status_t iree_hal_rocm_event_create(
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0,
       iree_allocator_malloc(host_allocator, sizeof(*event), (void**)&event));
+  iree_atomic_ref_count_init(&event->ref_count);  // -> 1
   event->host_allocator = host_allocator;
   event->symbols = symbols;
   event->pool = pool;
-  event->hip_event = NULL;
-  iree_atomic_ref_count_init(&event->ref_count);  // -> 1
+  event->cu_event = NULL;
 
   iree_status_t status = ROCM_RESULT_TO_STATUS(
-      symbols, hipEventCreate(&event->hip_event),
-      "hipEventCreate");
+      symbols, hipEventCreateWithFlags(&event->cu_event, hipEventDisableTiming),
+      "hipEventCreateWithFlags");
   if (iree_status_is_ok(status)) {
     *out_event = event;
   } else {
@@ -91,14 +92,17 @@ void iree_hal_rocm_event_retain(iree_hal_rocm_event_t* event) {
   iree_atomic_ref_count_inc(&event->ref_count);
 }
 
-static void iree_hal_rocm_event_pool_release(
+static void iree_hal_rocm_event_pool_release_event(
     iree_hal_rocm_event_pool_t* event_pool, iree_host_size_t event_count,
     iree_hal_rocm_event_t** events);
 
 void iree_hal_rocm_event_release(iree_hal_rocm_event_t* event) {
   if (iree_atomic_ref_count_dec(&event->ref_count) == 1) {
+    iree_hal_rocm_event_pool_t* pool = event->pool;
     // Release back to the pool if the reference count becomes 0.
-    iree_hal_rocm_event_pool_release(event->pool, 1, &event);
+    iree_hal_rocm_event_pool_release_event(pool, 1, &event);
+    // Drop our reference to the pool itself when we return event to it.
+    iree_hal_rocm_event_pool_release(pool);  // -1
   }
 }
 
@@ -107,10 +111,17 @@ void iree_hal_rocm_event_release(iree_hal_rocm_event_t* event) {
 //===----------------------------------------------------------------------===//
 
 struct iree_hal_rocm_event_pool_t {
+  // A reference count used to manage resource lifetime.
+  iree_atomic_ref_count_t ref_count;
+
   // The allocator used to create the event pool.
   iree_allocator_t host_allocator;
   // The symbols used to create and destroy hipEvent_t objects.
   iree_hal_rocm_dynamic_symbols_t* symbols;
+
+  // The HAL device that owns this pool. This cannot be NULL. We retain it to
+  // make sure the pool outlive the device.
+  iree_hal_device_t* owning_device;
 
   // Guards event related fields in the pool. We don't expect a performant
   // program to frequently allocate events for synchronization purposes; the
@@ -129,7 +140,11 @@ struct iree_hal_rocm_event_pool_t {
 };
 // + Additional inline allocation for holding events up to the capacity.
 
+static void iree_hal_rocm_event_pool_free(
+    iree_hal_rocm_event_pool_t* event_pool);
+
 iree_status_t iree_hal_rocm_event_pool_allocate(
+    iree_hal_device_t* owning_device,
     iree_hal_rocm_dynamic_symbols_t* symbols,
     iree_host_size_t available_capacity, iree_allocator_t host_allocator,
     iree_hal_rocm_event_pool_t** out_event_pool) {
@@ -145,6 +160,7 @@ iree_status_t iree_hal_rocm_event_pool_allocate(
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0,
       iree_allocator_malloc(host_allocator, total_size, (void**)&event_pool));
+  iree_atomic_ref_count_init(&event_pool->ref_count);  // -> 1
   event_pool->host_allocator = host_allocator;
   event_pool->symbols = symbols;
   iree_slim_mutex_initialize(&event_pool->event_mutex);
@@ -161,6 +177,7 @@ iree_status_t iree_hal_rocm_event_pool_allocate(
 
   if (iree_status_is_ok(status)) {
     *out_event_pool = event_pool;
+    iree_hal_device_retain(owning_device);  // +1
   } else {
     iree_hal_rocm_event_pool_free(event_pool);
   }
@@ -168,8 +185,10 @@ iree_status_t iree_hal_rocm_event_pool_allocate(
   return status;
 }
 
-void iree_hal_rocm_event_pool_free(iree_hal_rocm_event_pool_t* event_pool) {
+static void iree_hal_rocm_event_pool_free(
+    iree_hal_rocm_event_pool_t* event_pool) {
   iree_allocator_t host_allocator = event_pool->host_allocator;
+  iree_hal_device_t* device = event_pool->owning_device;
   IREE_TRACE_ZONE_BEGIN(z0);
 
   for (iree_host_size_t i = 0; i < event_pool->available_count; ++i) {
@@ -177,10 +196,26 @@ void iree_hal_rocm_event_pool_free(iree_hal_rocm_event_pool_t* event_pool) {
     iree_atomic_ref_count_dec(&event->ref_count);  // -> 0
     iree_hal_rocm_event_destroy(event);
   }
+  IREE_ASSERT_REF_COUNT_ZERO(&event_pool->ref_count);
+
   iree_slim_mutex_deinitialize(&event_pool->event_mutex);
   iree_allocator_free(host_allocator, event_pool);
 
+  // Now release the owning device.
+  iree_hal_device_release(device);  // -1
+
   IREE_TRACE_ZONE_END(z0);
+}
+
+void iree_hal_rocm_event_pool_retain(iree_hal_rocm_event_pool_t* event_pool) {
+  iree_atomic_ref_count_inc(&event_pool->ref_count);
+}
+
+void iree_hal_rocm_event_pool_release(
+    iree_hal_rocm_event_pool_t* event_pool) {
+  if (iree_atomic_ref_count_dec(&event_pool->ref_count) == 1) {
+    iree_hal_rocm_event_pool_free(event_pool);
+  }
 }
 
 iree_status_t iree_hal_rocm_event_pool_acquire(
@@ -219,8 +254,8 @@ iree_status_t iree_hal_rocm_event_pool_acquire(
                                            &out_events[from_pool_count + i]);
       if (!iree_status_is_ok(status)) {
         // Must release all events we've acquired so far.
-        iree_hal_rocm_event_pool_release(event_pool, from_pool_count + i,
-                                          out_events);
+        iree_hal_rocm_event_pool_release_event(event_pool, from_pool_count + i,
+                                                out_events);
         IREE_TRACE_ZONE_END(z1);
         IREE_TRACE_ZONE_END(z0);
         return status;
@@ -229,11 +264,17 @@ iree_status_t iree_hal_rocm_event_pool_acquire(
     IREE_TRACE_ZONE_END(z1);
   }
 
+  // Retain a reference to a pool when we pass event to the caller. When the
+  // caller returns event back to the pool they'll release the reference.
+  for (iree_host_size_t i = 0; i < event_count; ++i) {
+    iree_hal_rocm_event_pool_retain(out_events[i]->pool);  // +1
+  }
+
   IREE_TRACE_ZONE_END(z0);
   return iree_ok_status();
 }
 
-static void iree_hal_rocm_event_pool_release(
+static void iree_hal_rocm_event_pool_release_event(
     iree_hal_rocm_event_pool_t* event_pool, iree_host_size_t event_count,
     iree_hal_rocm_event_t** events) {
   IREE_ASSERT_ARGUMENT(event_pool);

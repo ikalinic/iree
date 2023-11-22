@@ -21,7 +21,9 @@ iree_status_t iree_hal_rocm_buffer_wrap(
     iree_hal_memory_access_t allowed_access,
     iree_hal_buffer_usage_t allowed_usage, iree_device_size_t allocation_size,
     iree_device_size_t byte_offset, iree_device_size_t byte_length,
-    hipDeviceptr_t device_ptr, void* host_ptr, iree_hal_buffer_t** out_buffer);
+    hipDeviceptr_t device_ptr, void* host_ptr,
+    iree_hal_buffer_release_callback_t release_callback,
+    iree_allocator_t host_allocator, iree_hal_buffer_t** out_buffer);
 
 // Returns the ROCm base pointer for the given |buffer|.
 // This is the entire allocated_buffer and must be offset by the buffer
@@ -30,6 +32,12 @@ hipDeviceptr_t iree_hal_rocm_buffer_device_pointer(iree_hal_buffer_t* buffer);
 
 // Returns the ROCm host pointer for the given |buffer|, if available.
 void* iree_hal_rocm_buffer_host_pointer(iree_hal_buffer_t* buffer);
+
+// Drops the release callback so that when the buffer is destroyed no callback
+// will be made. This is not thread safe but all callers are expected to be
+// holding an allocation and the earliest the buffer could be destroyed is after
+// this call returns and the caller has released its reference.
+void iree_hal_rocm_buffer_drop_release_callback(iree_hal_buffer_t* buffer);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -53,8 +53,6 @@ typedef struct iree_hal_rocm_graph_command_buffer_t {
 
   int32_t push_constants[IREE_HAL_ROCM_MAX_PUSH_CONSTANT_COUNT];
 
-  // // Keep track of the current set of kernel arguments.
-  // void* current_descriptor[];
   // The current bound descriptor sets.
   struct {
     hipDeviceptr_t bindings[IREE_HAL_ROCM_MAX_DESCRIPTOR_SET_BINDING_COUNT];
@@ -91,22 +89,23 @@ iree_status_t iree_hal_rocm_graph_command_buffer_create(
   IREE_TRACE_ZONE_BEGIN(z0);
 
   iree_hal_rocm_graph_command_buffer_t* command_buffer = NULL;
-  iree_status_t status =
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0,
       iree_allocator_malloc(context->host_allocator, sizeof(*command_buffer),
-                            (void**)&command_buffer);
-  if (iree_status_is_ok(status)) {
-    iree_hal_command_buffer_initialize(
-        device, mode, command_categories, queue_affinity, binding_capacity,
-        &iree_hal_rocm_graph_command_buffer_vtable, &command_buffer->base);
-    command_buffer->context = context;
-    iree_arena_initialize(block_pool, &command_buffer->arena);
-    command_buffer->hip_graph = NULL;
-    command_buffer->hip_graph_exec = NULL;
-    command_buffer->hip_barrier_node = NULL;
-    command_buffer->graph_node_count = 0;
-    status = iree_hal_resource_set_allocate(block_pool,
-                                            &command_buffer->resource_set);
-  }
+                            (void**)&command_buffer));
+  iree_hal_command_buffer_initialize(
+      device, mode, command_categories, queue_affinity, binding_capacity,
+      &iree_hal_rocm_graph_command_buffer_vtable, &command_buffer->base);
+  command_buffer->context = context;
+  iree_arena_initialize(block_pool, &command_buffer->arena);
+  command_buffer->hip_graph = NULL;
+  command_buffer->hip_graph_exec = NULL;
+  command_buffer->hip_barrier_node = NULL;
+  command_buffer->graph_node_count = 0;
+
+  iree_status_t status =
+      iree_hal_resource_set_allocate(block_pool, &command_buffer->resource_set);
+
   if (iree_status_is_ok(status)) {
     iree_hal_collective_batch_initialize(&command_buffer->arena,
                                          command_buffer->resource_set,
@@ -152,18 +151,18 @@ static void iree_hal_rocm_graph_command_buffer_destroy(
   IREE_TRACE_ZONE_END(z0);
 }
 
+bool iree_hal_rocm_graph_command_buffer_isa(
+    iree_hal_command_buffer_t* command_buffer) {
+  return iree_hal_resource_is(&command_buffer->resource,
+                              &iree_hal_rocm_graph_command_buffer_vtable);
+}
+
 hipGraphExec_t iree_hal_rocm_graph_command_buffer_handle(
     iree_hal_command_buffer_t* base_command_buffer) {
   if (!iree_hal_rocm_graph_command_buffer_isa(base_command_buffer)) return NULL;
   iree_hal_rocm_graph_command_buffer_t* command_buffer =
       iree_hal_rocm_graph_command_buffer_cast(base_command_buffer);
   return command_buffer->hip_graph_exec;
-}
-
-bool iree_hal_rocm_graph_command_buffer_isa(
-    iree_hal_command_buffer_t* command_buffer) {
-  return iree_hal_resource_is(&command_buffer->resource,
-                              &iree_hal_rocm_graph_command_buffer_vtable);
 }
 
 // Flushes any pending batched collective operations.
@@ -283,6 +282,7 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_execution_barrier(
   iree_hal_rocm_graph_command_buffer_t* command_buffer =
       iree_hal_rocm_graph_command_buffer_cast(base_command_buffer);
   IREE_TRACE_ZONE_BEGIN(z0);
+
   IREE_RETURN_IF_ERROR(
       iree_hal_rocm_graph_command_buffer_flush_collectives(command_buffer));
 
@@ -370,16 +370,19 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_fill_buffer(
     iree_host_size_t pattern_length) {
   iree_hal_rocm_graph_command_buffer_t* command_buffer =
       iree_hal_rocm_graph_command_buffer_cast(base_command_buffer);
-  IREE_RETURN_IF_ERROR(
-      iree_hal_rocm_graph_command_buffer_flush_collectives(command_buffer));
+  IREE_TRACE_ZONE_BEGIN(z0);
 
-  IREE_RETURN_IF_ERROR(iree_hal_resource_set_insert(
-      command_buffer->resource_set, 1, &target_buffer));
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, iree_hal_rocm_graph_command_buffer_flush_collectives(command_buffer));
+
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, iree_hal_resource_set_insert(command_buffer->resource_set, 1,
+                                       &target_buffer));
 
   hipDeviceptr_t target_device_buffer = iree_hal_rocm_buffer_device_pointer(
       iree_hal_buffer_allocated_buffer(target_buffer));
   target_offset += iree_hal_buffer_byte_offset(target_buffer);
-  uint32_t dword_pattern = iree_hal_rocm_splat_pattern(pattern, pattern_length);
+  uint32_t pattern_4byte = iree_hal_rocm_splat_pattern(pattern, pattern_length);
 
   hipMemsetParams params = {
       .dst = (hipDeviceptr_t)((uintptr_t)target_device_buffer + target_offset),
@@ -387,7 +390,7 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_fill_buffer(
       .pitch = 0,                        // unused if height == 1
       .width = length / pattern_length,  // element count
       .height = 1,
-      .value = dword_pattern,
+      .value = pattern_4byte,
   };
 
   if (command_buffer->graph_node_count >=
@@ -414,8 +417,9 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_update_buffer(
     iree_device_size_t target_offset, iree_device_size_t length) {
   iree_hal_rocm_graph_command_buffer_t* command_buffer =
       iree_hal_rocm_graph_command_buffer_cast(base_command_buffer);
-  IREE_RETURN_IF_ERROR(
-      iree_hal_rocm_graph_command_buffer_flush_collectives(command_buffer));
+  IREE_TRACE_ZONE_BEGIN(z0);
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, iree_hal_rocm_graph_command_buffer_flush_collectives(command_buffer));
 
   // Allocate scratch space in the arena for the data and copy it in.
   // The update buffer API requires that the command buffer capture the host
@@ -424,12 +428,14 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_update_buffer(
   // for the reused memory to change before the stream reaches the copy
   // operation and get the wrong data.
   uint8_t* storage = NULL;
-  IREE_RETURN_IF_ERROR(
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0,
       iree_arena_allocate(&command_buffer->arena, length, (void**)&storage));
   memcpy(storage, (const uint8_t*)source_buffer + source_offset, length);
 
-  IREE_RETURN_IF_ERROR(iree_hal_resource_set_insert(
-      command_buffer->resource_set, 1, &target_buffer));
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, iree_hal_resource_set_insert(command_buffer->resource_set, 1,
+                                       &target_buffer));
 
   hipDeviceptr_t target_device_buffer = iree_hal_rocm_buffer_device_pointer(
       iree_hal_buffer_allocated_buffer(target_buffer));
@@ -479,13 +485,9 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_copy_buffer(
   source_offset += iree_hal_buffer_byte_offset(source_buffer);
 
   hipDeviceptr_t src =
-      (hipDeviceptr_t)((uintptr_t)source_device_buffer +
-                       iree_hal_buffer_byte_offset(source_buffer) +
-                       source_offset);
+      (hipDeviceptr_t)((uintptr_t)source_device_buffer + source_offset);
   hipDeviceptr_t dst =
-      (hipDeviceptr_t)((uintptr_t)target_device_buffer +
-                       iree_hal_buffer_byte_offset(target_buffer) +
-                       target_offset);
+      (hipDeviceptr_t)((uintptr_t)target_device_buffer + target_offset);
 
   if (command_buffer->graph_node_count >=
       IREE_HAL_ROCM_MAX_CONCURRENT_GRAPH_NODE_COUNT) {

@@ -6,8 +6,6 @@
 
 #include "experimental/rocm/event_semaphore.h"
 
-#include <stddef.h>
-
 #include "experimental/rocm/context_wrapper.h"
 #include "experimental/rocm/dynamic_symbols.h"
 #include "experimental/rocm/rocm_headers.h"
@@ -160,7 +158,7 @@ static iree_status_t iree_hal_rocm_semaphore_signal(
 }
 
 static void iree_hal_rocm_semaphore_fail(iree_hal_semaphore_t* base_semaphore,
-                                          iree_status_t status) {
+                                         iree_status_t status) {
   iree_hal_rocm_semaphore_t* semaphore =
       iree_hal_rocm_semaphore_cast(base_semaphore);
   IREE_TRACE_ZONE_BEGIN(z0);
@@ -186,8 +184,8 @@ static void iree_hal_rocm_semaphore_fail(iree_hal_semaphore_t* base_semaphore,
   iree_slim_mutex_unlock(&semaphore->mutex);
 
   // Notify timepoints - note that this must happen outside the lock.
-  iree_hal_semaphore_notify(&semaphore->base,
-                            IREE_HAL_SEMAPHORE_FAILURE_VALUE, status_code);
+  iree_hal_semaphore_notify(&semaphore->base, IREE_HAL_SEMAPHORE_FAILURE_VALUE,
+                            status_code);
   IREE_TRACE_ZONE_END(z0);
 }
 
@@ -198,8 +196,7 @@ static void iree_hal_rocm_semaphore_fail(iree_hal_semaphore_t* base_semaphore,
 static iree_status_t iree_hal_rocm_semaphore_timepoint_host_wait_callback(
     void* user_data, iree_hal_semaphore_t* semaphore, uint64_t value,
     iree_status_code_t status_code) {
-  iree_hal_rocm_timepoint_t* timepoint =
-      (iree_hal_rocm_timepoint_t*)user_data;
+  iree_hal_rocm_timepoint_t* timepoint = (iree_hal_rocm_timepoint_t*)user_data;
   iree_event_set(&timepoint->timepoint.host_wait);
   return iree_ok_status();
 }
@@ -253,6 +250,7 @@ static bool iree_hal_rocm_semaphore_acquire_event_host_wait(
       break;
     }
   }
+
   iree_slim_mutex_unlock(&semaphore->base.timepoint_mutex);
 
   IREE_TRACE_ZONE_END(z0);
@@ -289,20 +287,20 @@ static iree_status_t iree_hal_rocm_semaphore_wait(
 
   iree_time_t deadline_ns = iree_timeout_as_deadline_ns(timeout);
 
-  // // Slow path: try to see if we can have a device CUevent to wait on. This
-  // // should happen outside of the lock given that acquiring has its own internal
-  // // locks. This is faster than waiting on a host timepoint.
-  // iree_hal_rocm_event_t* wait_event = NULL;
-  // if (iree_hal_rocm_semaphore_acquire_event_host_wait(semaphore, value,
-  //                                                      &wait_event)) {
-  //   IREE_ROCM_RETURN_AND_END_ZONE_IF_ERROR(
-  //       z0, semaphore->context->syms,
-  //       hipEventSynchronize(iree_hal_rocm_event_handle(wait_event)),
-  //       "hipEventSynchronize");
-  //   iree_hal_rocm_event_release(wait_event);
-  //   IREE_TRACE_ZONE_END(z0);
-  //   return iree_ok_status();
-  // }
+  // Slow path: try to see if we can have a device CUevent to wait on. This
+  // should happen outside of the lock given that acquiring has its own
+  // internal locks. This is faster than waiting on a host timepoint.
+  iree_hal_rocm_event_t* wait_event = NULL;
+  if (iree_hal_rocm_semaphore_acquire_event_host_wait(semaphore, value,
+                                                       &wait_event)) {
+    IREE_ROCM_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, semaphore->context->syms,
+        hipEventSynchronize(iree_hal_rocm_event_handle(wait_event)),
+        "hipEventSynchronize");
+    iree_hal_rocm_event_release(wait_event);
+    IREE_TRACE_ZONE_END(z0);
+    return iree_ok_status();
+  }
 
   // Slow path: acquire a timepoint. This should happen outside of the lock to
   // given that acquiring has its own internal locks.
@@ -322,7 +320,7 @@ static iree_status_t iree_hal_rocm_semaphore_wait(
     iree_hal_semaphore_cancel_timepoint(&semaphore->base, &timepoint->base);
   }
   iree_hal_rocm_timepoint_pool_release(semaphore->timepoint_pool, 1,
-                                        &timepoint);
+                                       &timepoint);
   IREE_TRACE_ZONE_END(z0);
   return status;
 }
@@ -335,8 +333,7 @@ static iree_status_t iree_hal_rocm_semaphore_wait(
 static iree_status_t iree_hal_rocm_semaphore_timepoint_device_signal_callback(
     void* user_data, iree_hal_semaphore_t* semaphore, uint64_t value,
     iree_status_code_t status_code) {
-  iree_hal_rocm_timepoint_t* timepoint =
-      (iree_hal_rocm_timepoint_t*)user_data;
+  iree_hal_rocm_timepoint_t* timepoint = (iree_hal_rocm_timepoint_t*)user_data;
   // Just release the timepoint back to the pool. This will decrease the
   // reference count of the underlying ROCM event internally.
   iree_hal_rocm_timepoint_pool_release(timepoint->pool, 1, &timepoint);
@@ -374,8 +371,7 @@ iree_status_t iree_hal_rocm_event_semaphore_acquire_timepoint_device_signal(
   iree_slim_mutex_lock(&semaphore->base.timepoint_mutex);
   for (iree_hal_semaphore_timepoint_t* tp = semaphore->base.timepoint_list.head;
        tp != NULL; tp = tp->next) {
-    iree_hal_rocm_timepoint_t* wait_timepoint =
-        (iree_hal_rocm_timepoint_t*)tp;
+    iree_hal_rocm_timepoint_t* wait_timepoint = (iree_hal_rocm_timepoint_t*)tp;
     if (wait_timepoint->kind == IREE_HAL_ROCM_TIMEPOINT_KIND_DEVICE_WAIT &&
         wait_timepoint->timepoint.device_wait == NULL &&
         wait_timepoint->base.minimum_value <= to_value) {
@@ -397,8 +393,7 @@ iree_status_t iree_hal_rocm_event_semaphore_acquire_timepoint_device_signal(
 static iree_status_t iree_hal_rocm_semaphore_timepoint_device_wait_callback(
     void* user_data, iree_hal_semaphore_t* semaphore, uint64_t value,
     iree_status_code_t status_code) {
-  iree_hal_rocm_timepoint_t* timepoint =
-      (iree_hal_rocm_timepoint_t*)user_data;
+  iree_hal_rocm_timepoint_t* timepoint = (iree_hal_rocm_timepoint_t*)user_data;
   // Just release the timepoint back to the pool. This will decrease the
   // reference count of the underlying ROCM event internally.
   iree_hal_rocm_timepoint_pool_release(timepoint->pool, 1, &timepoint);
@@ -428,26 +423,35 @@ iree_status_t iree_hal_rocm_event_semaphore_acquire_timepoint_device_wait(
           .user_data = wait_timepoint,
       },
       &wait_timepoint->base);
+  iree_hal_rocm_event_t* wait_event = NULL;
+  if (iree_hal_rocm_semaphore_acquire_event_host_wait(semaphore, min_value,
+                                                       &wait_event)) {
+    // We've found an existing signal timepoint to wait on; we don't need a
+    // standalone wait timepoint anymore. Decrease its refcount before
+    // overwriting it to return it back to the pool and retain the existing one.
+    iree_hal_rocm_event_release(wait_timepoint->timepoint.device_wait);
+    wait_timepoint->timepoint.device_wait = wait_event;
+  }
 
   // Scan through the timepoint list and try to find a device event signal to
   // wait on. We need to lock with the timepoint list mutex here.
-  iree_slim_mutex_lock(&semaphore->base.timepoint_mutex);
-  for (iree_hal_semaphore_timepoint_t* tp = semaphore->base.timepoint_list.head;
-       tp != NULL; tp = tp->next) {
-    iree_hal_rocm_timepoint_t* signal_timepoint =
-        (iree_hal_rocm_timepoint_t*)tp;
-    if (signal_timepoint->kind == IREE_HAL_ROCM_TIMEPOINT_KIND_DEVICE_SIGNAL &&
-        signal_timepoint->base.minimum_value >= min_value) {
-       // We've found an existing signal timepoint to wait on; we don't need a
-      // standalone wait timepoint anymore. Decrease its refcount before
-      // overwriting it to return it back to the pool and retain the new one.
-      iree_hal_rocm_event_release(wait_timepoint->timepoint.device_wait); 
-      iree_hal_rocm_event_t* event = signal_timepoint->timepoint.device_signal;
-      iree_hal_rocm_event_retain(event);
-      wait_timepoint->timepoint.device_wait = event;
-    }
-  }
-  iree_slim_mutex_unlock(&semaphore->base.timepoint_mutex);
+  // iree_slim_mutex_lock(&semaphore->base.timepoint_mutex);
+  // for (iree_hal_semaphore_timepoint_t* tp = semaphore->base.timepoint_list.head;
+  //      tp != NULL; tp = tp->next) {
+  //   iree_hal_rocm_timepoint_t* signal_timepoint =
+  //       (iree_hal_rocm_timepoint_t*)tp;
+  //   if (signal_timepoint->kind == IREE_HAL_ROCM_TIMEPOINT_KIND_DEVICE_SIGNAL &&
+  //       signal_timepoint->base.minimum_value >= min_value) {
+  //     // We've found an existing signal timepoint to wait on; we don't need a
+  //     // standalone wait timepoint anymore. Decrease its refcount before
+  //     // overwriting it to return it back to the pool and retain the new one.
+  //     iree_hal_rocm_event_release(wait_timepoint->timepoint.device_wait);
+  //     iree_hal_rocm_event_t* event = signal_timepoint->timepoint.device_signal;
+  //     iree_hal_rocm_event_retain(event);
+  //     wait_timepoint->timepoint.device_wait = event;
+  //   }
+  // }
+  // iree_slim_mutex_unlock(&semaphore->base.timepoint_mutex);
 
   *out_event =
       iree_hal_rocm_event_handle(wait_timepoint->timepoint.device_wait);

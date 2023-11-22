@@ -11,7 +11,6 @@
 
 #include "experimental/rocm/context_wrapper.h"
 #include "experimental/rocm/pending_queue_actions.h"
-#include "experimental/rocm/status_util.h"
 #include "experimental/rocm/timepoint_pool.h"
 #include "iree/base/api.h"
 #include "iree/hal/api.h"

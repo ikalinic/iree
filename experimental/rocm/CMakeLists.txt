@@ -57,6 +57,8 @@ iree_cc_library(
     "graph_command_buffer.h"
     "direct_command_buffer.c"
     "direct_command_buffer.h"
+    "memory_pools.c"
+    "memory_pools.h"
     "native_executable.c"
     "native_executable.h"
     "nop_executable_cache.c"

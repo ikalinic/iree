@@ -16,6 +16,7 @@ typedef struct iree_hal_rocm_buffer_t {
   iree_hal_buffer_t base;
   void* host_ptr;
   hipDeviceptr_t device_ptr;
+  iree_hal_buffer_release_callback_t release_callback;
 } iree_hal_rocm_buffer_t;
 
 static const iree_hal_buffer_vtable_t iree_hal_rocm_buffer_vtable;
@@ -26,18 +27,24 @@ static iree_hal_rocm_buffer_t* iree_hal_rocm_buffer_cast(
   return (iree_hal_rocm_buffer_t*)base_value;
 }
 
+static const iree_hal_rocm_buffer_t* iree_hal_rocm_buffer_const_cast(
+    const iree_hal_buffer_t* base_value) {
+  IREE_HAL_ASSERT_TYPE(base_value, &iree_hal_rocm_buffer_vtable);
+  return (const iree_hal_rocm_buffer_t*)base_value;
+}
+
 iree_status_t iree_hal_rocm_buffer_wrap(
     iree_hal_allocator_t* allocator, iree_hal_memory_type_t memory_type,
     iree_hal_memory_access_t allowed_access,
     iree_hal_buffer_usage_t allowed_usage, iree_device_size_t allocation_size,
     iree_device_size_t byte_offset, iree_device_size_t byte_length,
-    hipDeviceptr_t device_ptr, void* host_ptr, iree_hal_buffer_t** out_buffer) {
+    hipDeviceptr_t device_ptr, void* host_ptr,
+    iree_hal_buffer_release_callback_t release_callback,
+    iree_allocator_t host_allocator, iree_hal_buffer_t** out_buffer) {
   IREE_ASSERT_ARGUMENT(allocator);
   IREE_ASSERT_ARGUMENT(out_buffer);
   IREE_TRACE_ZONE_BEGIN(z0);
 
-  iree_allocator_t host_allocator =
-      iree_hal_allocator_host_allocator(allocator);
   iree_hal_rocm_buffer_t* buffer = NULL;
   iree_status_t status =
       iree_allocator_malloc(host_allocator, sizeof(*buffer), (void**)&buffer);
@@ -48,6 +55,7 @@ iree_status_t iree_hal_rocm_buffer_wrap(
                                &iree_hal_rocm_buffer_vtable, &buffer->base);
     buffer->host_ptr = host_ptr;
     buffer->device_ptr = device_ptr;
+    buffer->release_callback = release_callback;
     *out_buffer = &buffer->base;
   }
 
@@ -59,6 +67,10 @@ static void iree_hal_rocm_buffer_destroy(iree_hal_buffer_t* base_buffer) {
   iree_hal_rocm_buffer_t* buffer = iree_hal_rocm_buffer_cast(base_buffer);
   iree_allocator_t host_allocator = base_buffer->host_allocator;
   IREE_TRACE_ZONE_BEGIN(z0);
+  if (buffer->release_callback.fn) {
+    buffer->release_callback.fn(buffer->release_callback.user_data,
+                                base_buffer);
+  }
   iree_allocator_free(host_allocator, buffer);
   IREE_TRACE_ZONE_END(z0);
 }
@@ -125,6 +137,12 @@ hipDeviceptr_t iree_hal_rocm_buffer_device_pointer(
 void* iree_hal_rocm_buffer_host_pointer(iree_hal_buffer_t* base_buffer) {
   iree_hal_rocm_buffer_t* buffer = iree_hal_rocm_buffer_cast(base_buffer);
   return buffer->host_ptr;
+}
+
+void iree_hal_rocm_buffer_drop_release_callback(
+    iree_hal_buffer_t* base_buffer) {
+  iree_hal_rocm_buffer_t* buffer = iree_hal_rocm_buffer_cast(base_buffer);
+  buffer->release_callback = iree_hal_buffer_release_callback_null();
 }
 
 static const iree_hal_buffer_vtable_t iree_hal_rocm_buffer_vtable = {

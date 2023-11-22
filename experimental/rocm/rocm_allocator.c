@@ -13,11 +13,17 @@
 #include "experimental/rocm/status_util.h"
 #include "iree/base/api.h"
 
+#if IREE_TRACING_FEATURES & IREE_TRACING_FEATURE_ALLOCATION_TRACKING
+static const char* IREE_HAL_ROCM_ALLOCATOR_ID = "ROCM unpooled";
+#endif  // IREE_TRACING_FEATURE_ALLOCATION_TRACKING
+
 typedef struct iree_hal_rocm_allocator_t {
   iree_hal_resource_t resource;
   iree_hal_rocm_context_wrapper_t* context;
   hipDevice_t device;
   hipStream_t stream;
+
+  iree_hal_rocm_memory_pools_t* pools;
 
   bool supports_concurrent_managed_access;
 
@@ -34,7 +40,9 @@ static iree_hal_rocm_allocator_t* iree_hal_rocm_allocator_cast(
 
 iree_status_t iree_hal_rocm_allocator_create(
     iree_hal_rocm_context_wrapper_t* context, hipDevice_t device,
-    hipStream_t stream, iree_hal_allocator_t** out_allocator) {
+    hipStream_t stream, iree_hal_rocm_memory_pools_t* pools,
+    iree_hal_allocator_t** out_allocator) {
+  IREE_ASSERT_ARGUMENT(pools);
   IREE_ASSERT_ARGUMENT(context);
   IREE_TRACE_ZONE_BEGIN(z0);
 
@@ -66,6 +74,7 @@ iree_status_t iree_hal_rocm_allocator_create(
     allocator->context = context;
     allocator->device = device;
     allocator->stream = stream;
+    allocator->pools = pools;
     allocator->supports_concurrent_managed_access =
         supports_concurrent_managed_access != 0;
     *out_allocator = (iree_hal_allocator_t*)allocator;
@@ -106,6 +115,8 @@ static void iree_hal_rocm_allocator_query_statistics(
     iree_hal_rocm_allocator_t* allocator =
         iree_hal_rocm_allocator_cast(base_allocator);
     memcpy(out_statistics, &allocator->statistics, sizeof(*out_statistics));
+    iree_hal_rocm_memory_pools_merge_statistics(allocator->pools,
+                                                out_statistics);
   });
 }
 
@@ -261,21 +272,45 @@ static iree_status_t iree_hal_rocm_allocator_allocate_buffer(
     const iree_hal_buffer_params_t* IREE_RESTRICT params,
     iree_device_size_t allocation_size,
     iree_hal_buffer_t** IREE_RESTRICT out_buffer) {
+  IREE_ASSERT_ARGUMENT(base_allocator);
+  IREE_ASSERT_ARGUMENT(params);
+  IREE_ASSERT_ARGUMENT(out_buffer);
   iree_hal_rocm_allocator_t* allocator =
       iree_hal_rocm_allocator_cast(base_allocator);
+
   // Coerce options into those required by the current device.
   iree_hal_buffer_params_t compat_params = *params;
-  if (!iree_all_bits_set(iree_hal_rocm_allocator_query_buffer_compatibility(
-                             base_allocator, &compat_params, &allocation_size),
+  iree_hal_buffer_compatibility_t compatibility =
+      iree_hal_rocm_allocator_query_buffer_compatibility(
+          base_allocator, &compat_params, &allocation_size);
+  if (!iree_all_bits_set(compatibility,
                          IREE_HAL_BUFFER_COMPATIBILITY_ALLOCATABLE)) {
+#if IREE_STATUS_MODE
+    iree_bitfield_string_temp_t temp0, temp1, temp2;
+    iree_string_view_t memory_type_str =
+        iree_hal_memory_type_format(params->type, &temp0);
+    iree_string_view_t usage_str =
+        iree_hal_buffer_usage_format(params->usage, &temp1);
+    iree_string_view_t compatibility_str =
+        iree_hal_buffer_compatibility_format(compatibility, &temp2);
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "allocator cannot allocate a buffer with the given parameters; "
+        "memory_type=%.*s, usage=%.*s, compatibility=%.*s",
+        (int)memory_type_str.size, memory_type_str.data, (int)usage_str.size,
+        usage_str.data, (int)compatibility_str.size, compatibility_str.data);
+#else
     return iree_make_status(
         IREE_STATUS_INVALID_ARGUMENT,
         "allocator cannot allocate a buffer with the given parameters");
+#endif  // IREE_STATUS_MODE
   }
 
   iree_status_t status = iree_ok_status();
   void* host_ptr = NULL;
   hipDeviceptr_t device_ptr = 0;
+  IREE_TRACE_ZONE_BEGIN_NAMED(z0, "iree_hal_rocm_buffer_allocate");
+  IREE_TRACE_ZONE_APPEND_VALUE_I64(z0, allocation_size);
   if (iree_all_bits_set(compat_params.type,
                         IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL)) {
     // Device local case.
@@ -314,16 +349,23 @@ static iree_status_t iree_hal_rocm_allocator_allocate_buffer(
     }
   }
 
+  IREE_TRACE_ZONE_END(z0);
+
   iree_hal_buffer_t* buffer = NULL;
   if (iree_status_is_ok(status)) {
     status = iree_hal_rocm_buffer_wrap(
         (iree_hal_allocator_t*)allocator, compat_params.type,
         compat_params.access, compat_params.usage, allocation_size,
         /*byte_offset=*/0,
-        /*byte_length=*/allocation_size, device_ptr, host_ptr, &buffer);
+        /*byte_length=*/allocation_size, device_ptr, host_ptr,
+        iree_hal_buffer_release_callback_null(),
+        iree_hal_allocator_host_allocator(base_allocator), &buffer);
   }
 
   if (iree_status_is_ok(status)) {
+    IREE_TRACE_ALLOC_NAMED(IREE_HAL_ROCM_ALLOCATOR_ID,
+                           (void*)iree_hal_rocm_buffer_device_pointer(buffer),
+                           allocation_size);
     IREE_STATISTICS(iree_hal_allocator_statistics_record_alloc(
         &allocator->statistics, compat_params.type, allocation_size));
     *out_buffer = buffer;

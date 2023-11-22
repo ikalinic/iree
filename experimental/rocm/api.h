@@ -20,6 +20,7 @@ extern "C" {
 // iree_hal_rocm_device_t
 //===----------------------------------------------------------------------===//
 
+
 // Defines how command buffers are recorded and executed.
 typedef enum iree_hal_rocm_command_buffer_mode_e {
   // Command buffers are recorded into ROCM null stream.
@@ -29,6 +30,26 @@ typedef enum iree_hal_rocm_command_buffer_mode_e {
   // Command buffers are recorded into ROCM graphs.
   IREE_HAL_ROCM_COMMAND_BUFFER_MODE_GRAPH = 2,
 } iree_hal_rocm_command_buffer_mode_t;
+
+// Parameters defining a hipMemPool_t.
+typedef struct iree_hal_rocm_memory_pool_params_t {
+    // Minimum number of bytes to keep in the pool when trimming with
+    // iree_hal_device_trim.
+    uint64_t minimum_capacity;
+    // Soft maximum number of bytes to keep in the pool.
+    // When more than this is allocated the extra will be freed at the next
+    // device synchronization in order to remain under the threshold.
+    uint64_t release_threshold;
+    // TODO: per-device access permissions array.
+} iree_hal_rocm_memory_pool_params_t;
+
+// Parameters for each hipMemPool_t used for queue-ordered allocations.
+typedef struct iree_hal_rocm_memory_pooling_params_t {
+    // Used exclusively for DEVICE_LOCAL allocations.
+    iree_hal_rocm_memory_pool_params_t device_local;
+    // Used for any host-visible/host-local memory types.
+    iree_hal_rocm_memory_pool_params_t other;
+} iree_hal_rocm_memory_pooling_params_t;
 
 // Parameters configuring an iree_hal_rocm_device_t.
 // Must be initialized with iree_hal_rocm_device_params_initialize prior to use.
@@ -59,6 +80,12 @@ typedef struct iree_hal_rocm_device_params_t {
   // tracing with this enabled.
   bool stream_tracing;
 
+  // Whether to use async allocations even if reported as available by the
+  // device. Defaults to true when the device supports it.
+  bool async_allocations;
+
+  // Parameters for each hipMemPool_t used for queue-ordered allocations.
+  iree_hal_rocm_memory_pooling_params_t memory_pools;
 } iree_hal_rocm_device_params_t;
 
 // Initializes |out_params| to default values.
