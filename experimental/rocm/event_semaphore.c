@@ -11,6 +11,7 @@
 #include "experimental/rocm/rocm_headers.h"
 #include "experimental/rocm/status_util.h"
 #include "experimental/rocm/timepoint_pool.h"
+#include "hip/hip_runtime_api.h"
 #include "iree/base/internal/synchronization.h"
 #include "iree/hal/utils/semaphore_base.h"
 
@@ -287,7 +288,7 @@ static iree_status_t iree_hal_rocm_semaphore_wait(
 
   iree_time_t deadline_ns = iree_timeout_as_deadline_ns(timeout);
 
-  // Slow path: try to see if we can have a device CUevent to wait on. This
+  // Slow path: try to see if we can have a device hipEvent_t to wait on. This
   // should happen outside of the lock given that acquiring has its own
   // internal locks. This is faster than waiting on a host timepoint.
   iree_hal_rocm_event_t* wait_event = NULL;
@@ -423,18 +424,9 @@ iree_status_t iree_hal_rocm_event_semaphore_acquire_timepoint_device_wait(
           .user_data = wait_timepoint,
       },
       &wait_timepoint->base);
-  iree_hal_rocm_event_t* wait_event = NULL;
-  if (iree_hal_rocm_semaphore_acquire_event_host_wait(semaphore, min_value,
-                                                       &wait_event)) {
-    // We've found an existing signal timepoint to wait on; we don't need a
-    // standalone wait timepoint anymore. Decrease its refcount before
-    // overwriting it to return it back to the pool and retain the existing one.
-    iree_hal_rocm_event_release(wait_timepoint->timepoint.device_wait);
-    wait_timepoint->timepoint.device_wait = wait_event;
-  }
 
-  // Scan through the timepoint list and try to find a device event signal to
-  // wait on. We need to lock with the timepoint list mutex here.
+  // // Scan through the timepoint list and try to find a device event signal to
+  // // wait on. We need to lock with the timepoint list mutex here.
   // iree_slim_mutex_lock(&semaphore->base.timepoint_mutex);
   // for (iree_hal_semaphore_timepoint_t* tp = semaphore->base.timepoint_list.head;
   //      tp != NULL; tp = tp->next) {
@@ -452,6 +444,16 @@ iree_status_t iree_hal_rocm_event_semaphore_acquire_timepoint_device_wait(
   //   }
   // }
   // iree_slim_mutex_unlock(&semaphore->base.timepoint_mutex);
+  
+  iree_hal_rocm_event_t* wait_event = NULL;
+  if (iree_hal_rocm_semaphore_acquire_event_host_wait(semaphore, min_value,
+                                                       &wait_event)) {
+    // We've found an existing signal timepoint to wait on; we don't need a
+    // standalone wait timepoint anymore. Decrease its refcount before
+    // overwriting it to return it back to the pool and retain the existing one.
+    iree_hal_rocm_event_release(wait_timepoint->timepoint.device_wait);
+    wait_timepoint->timepoint.device_wait = wait_event;
+  }
 
   *out_event =
       iree_hal_rocm_event_handle(wait_timepoint->timepoint.device_wait);

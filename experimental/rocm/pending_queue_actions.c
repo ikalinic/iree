@@ -5,18 +5,26 @@
 #include "experimental/rocm/pending_queue_actions.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "experimental/rocm/context_wrapper.h"
+#include "experimental/rocm/direct_command_buffer.h"
 #include "experimental/rocm/dynamic_symbols.h"
-#include "experimental/rocm/status_util.h"
 #include "experimental/rocm/event_semaphore.h"
 #include "experimental/rocm/graph_command_buffer.h"
-#include "experimental/rocm/direct_command_buffer.h"
+#include "experimental/rocm/rocm_device.h"
+#include "experimental/rocm/status_util.h"
 #include "iree/base/api.h"
 #include "iree/base/internal/arena.h"
+#include "iree/base/internal/atomic_slist.h"
 #include "iree/base/internal/synchronization.h"
+#include "iree/base/internal/threading.h"
 #include "iree/hal/api.h"
+#include "iree/hal/utils/deferred_command_buffer.h"
 #include "iree/hal/utils/resource_set.h"
+
+// The maximal number of hipEvent_t objects a command buffer can wait.
+#define IREE_HAL_ROCM_MAX_WAIT_EVENT_COUNT 32
 
 //===----------------------------------------------------------------------===//
 // Queue action
@@ -49,6 +57,10 @@ typedef struct iree_hal_rocm_queue_action_t {
     } command_buffers;
   } payload;
 
+  // The device from which to allocate ROCM stream-based command buffers for
+  // applying deferred command buffers.
+  iree_hal_device_t* device;
+
   // The stream to launch main GPU workload.
   hipStream_t dispatch_hip_stream;
   // The stream to launch ROCM host function callbacks.
@@ -63,7 +75,7 @@ typedef struct iree_hal_rocm_queue_action_t {
   iree_hal_semaphore_list_t signal_semaphore_list;
 
   // Scratch fields for analyzing whether actions are ready to issue.
-  hipEvent_t* events;
+  hipEvent_t events[IREE_HAL_ROCM_MAX_WAIT_EVENT_COUNT];
   iree_host_size_t event_count;
   bool is_pending;
 } iree_hal_rocm_queue_action_t;
@@ -129,28 +141,97 @@ static void iree_hal_rocm_queue_action_list_take_all(
 }
 
 //===----------------------------------------------------------------------===//
+// Ready-list processing
+//===----------------------------------------------------------------------===//
+
+// Ready action atomic slist entry struct.
+typedef struct iree_hal_rocm_atomic_slist_entry_t {
+  iree_hal_rocm_queue_action_t* ready_list_head;
+  iree_atomic_slist_intrusive_ptr_t slist_next;
+} iree_hal_rocm_atomic_slist_entry_t;
+
+// Ready action atomic slist.
+IREE_TYPED_ATOMIC_SLIST_WRAPPER(iree_hal_rocm_ready_action,
+                                iree_hal_rocm_atomic_slist_entry_t,
+                                offsetof(iree_hal_rocm_atomic_slist_entry_t,
+                                         slist_next));
+
+// The ready-list processing worker's working/exiting state.
+typedef enum iree_hal_rocm_worker_state_e {
+  IREE_HAL_ROCM_WORKER_STATE_IDLE_WAITING = 0,
+  IREE_HAL_ROCM_WORKER_STATE_WORKLOAD_PENDING = 1,
+  IREE_HAL_ROCM_WORKER_STATE_EXIT_REQUESTED = -1,
+  IREE_HAL_ROCM_WORKER_STATE_EXIT_COMMITTED = -2,
+} iree_hal_rocm_worker_state_t;
+
+// The data structure needed by a ready-list processing worker thread to issue
+// ready actions to the GPU.
+//
+// This data structure is shared between the parent thread, which owns the
+// whole pending actions queue, and the worker thread; so proper synchronization
+// is needed to touch it from both sides.
+//
+// The parent thread should push a list of ready actions to ready_worklist,
+// update working_state, and give notification naccordingly.
+// The worker thread waits on the notification and checks working_state, and
+// pops from the ready_worklist to process. THe worker thread also monintors
+// exiting_state and stops processing if requested by the parent thread.
+typedef struct iree_hal_rocm_working_area_t {
+  iree_notification_t notification;
+  iree_hal_rocm_ready_action_slist_t ready_worklist;  // atomic
+  iree_atomic_int32_t working_state;                  // atomic
+  iree_atomic_int32_t exiting_state;                  // atomic
+  iree_allocator_t host_allocator;                    // const
+} iree_hal_rocm_working_area_t;
+
+static void iree_hal_rocm_working_area_initialize(
+    iree_allocator_t host_allocator,
+    iree_hal_rocm_working_area_t* working_area) {
+  iree_notification_initialize(&working_area->notification);
+  iree_hal_rocm_ready_action_slist_initialize(&working_area->ready_worklist);
+  iree_atomic_store_int32(&working_area->working_state,
+                          IREE_HAL_ROCM_WORKER_STATE_IDLE_WAITING,
+                          iree_memory_order_relaxed);
+  iree_atomic_store_int32(&working_area->exiting_state,
+                          IREE_HAL_ROCM_WORKER_STATE_IDLE_WAITING,
+                          iree_memory_order_relaxed);
+  working_area->host_allocator = host_allocator;
+}
+
+static void iree_hal_rocm_working_area_deinitialize(
+    iree_hal_rocm_working_area_t* working_area) {
+  iree_hal_rocm_ready_action_slist_deinitialize(&working_area->ready_worklist);
+  iree_notification_deinitialize(&working_area->notification);
+}
+
+// The main function for the ready-list processing worker thread.
+static int iree_hal_rocm_worker_execute(void* args);
+
+//===----------------------------------------------------------------------===//
 // Pending queue actions
 //===----------------------------------------------------------------------===//
 
 struct iree_hal_rocm_pending_queue_actions_t {
-  // Abstract resource used for injecting reference counting and vtable;
-  // must be at offset 0.
+  // Abstract resource used for injecting reference counting and
+  // vtable;pending_queue_actions must be at offset 0.
   iree_hal_resource_t resource;
 
-  // // The allocator used to create the timepoint pool.
-  // iree_allocator_t host_allocator;
   // The block pool to allocate resource sets from.
   iree_arena_block_pool_t* block_pool;
 
   iree_hal_rocm_context_wrapper_t* context;
-  // // The symbols used to create and destroy hipEvent_t objects.
-  // const iree_hal_rocm_dynamic_symbols_t* symbols;
 
   // Non-recursive mutex guarding access to the action list.
   iree_slim_mutex_t action_mutex;
 
   // The double-linked list of pending actions.
   iree_hal_rocm_queue_action_list_t action_list IREE_GUARDED_BY(action_mutex);
+
+  // The worker thread that monitors incoming requests and issues ready actions
+  // to the GPU.
+  iree_thread_t* worker_thread;
+  // The worker's working area; data exchange place with the parent thread.
+  iree_hal_rocm_working_area_t working_area;
 };
 
 static const iree_hal_resource_vtable_t
@@ -175,7 +256,25 @@ iree_status_t iree_hal_rocm_pending_queue_actions_create(
   actions->block_pool = block_pool;
   iree_slim_mutex_initialize(&actions->action_mutex);
   memset(&actions->action_list, 0, sizeof(actions->action_list));
-  *out_actions = actions;
+
+  // Initialize the working area for the ready-list processing worker.
+  iree_hal_rocm_working_area_t* working_area = &actions->working_area;
+  iree_hal_rocm_working_area_initialize(context->host_allocator, working_area);
+
+  // Create the ready-list processing worker itself.
+  iree_thread_create_params_t params;
+  memset(&params, 0, sizeof(params));
+  params.name = IREE_SV("deferred_queue_worker");
+  params.create_suspended = false;
+  iree_status_t status = iree_thread_create(
+      iree_hal_rocm_worker_execute, working_area, params,
+      actions->context->host_allocator, &actions->worker_thread);
+
+  if (iree_status_is_ok(status)) {
+    *out_actions = actions;
+  } else {
+    iree_hal_rocm_pending_queue_actions_destroy((iree_hal_resource_t*)actions);
+  }
 
   IREE_TRACE_ZONE_END(z0);
   return iree_ok_status();
@@ -191,9 +290,23 @@ void iree_hal_rocm_pending_queue_actions_destroy(
   iree_hal_rocm_pending_queue_actions_t* actions =
       iree_hal_rocm_pending_queue_actions_cast(base_actions);
   iree_allocator_t host_allocator = actions->context->host_allocator;
+  iree_hal_rocm_working_area_t* working_area = &actions->working_area;
   IREE_TRACE_ZONE_BEGIN(z0);
 
   IREE_ASSERT(iree_hal_rocm_queue_action_list_is_empty(&actions->action_list));
+
+  iree_atomic_int32_t* exiting_state = &working_area->exiting_state;
+  iree_atomic_store_int32(exiting_state,
+                          IREE_HAL_ROCM_WORKER_STATE_EXIT_REQUESTED,
+                          iree_memory_order_relaxed);
+  iree_notification_post(&working_area->notification, IREE_ALL_WAITERS);
+  while (iree_atomic_load_int32(exiting_state, iree_memory_order_relaxed) !=
+         IREE_HAL_ROCM_WORKER_STATE_EXIT_COMMITTED) {
+    // Busy wait until the worker thread exits.
+  }
+  iree_thread_release(actions->worker_thread);
+
+  iree_hal_rocm_working_area_deinitialize(working_area);
 
   iree_slim_mutex_deinitialize(&actions->action_mutex);
   iree_allocator_free(host_allocator, actions);
@@ -206,8 +319,32 @@ static const iree_hal_resource_vtable_t
         .destroy = iree_hal_rocm_pending_queue_actions_destroy,
 };
 
-// Performs copy of the given |in_list| to |out_list| to retain the semaphore
-// and value list.
+// Copies of the given |in_list| to |out_list| to retain the command buffer
+// list.
+static iree_status_t iree_hal_rocm_copy_command_buffer_list(
+    iree_host_size_t command_buffer_count,
+    iree_hal_command_buffer_t* const* in_list, iree_allocator_t host_allocator,
+    iree_hal_command_buffer_t* const** out_list) {
+  if (command_buffer_count == 0) {
+    *out_list = NULL;
+  } else {
+    iree_host_size_t total_size = command_buffer_count * sizeof(*in_list);
+    IREE_RETURN_IF_ERROR(
+        iree_allocator_malloc(host_allocator, total_size, (void**)out_list));
+    memcpy((void*)*out_list, in_list, total_size);
+  }
+  return iree_ok_status();
+}
+
+// Frees the semaphore and value list inside |semaphore_list|.
+static void iree_hal_rocm_free_command_buffer_list(
+    iree_allocator_t host_allocator,
+    iree_hal_command_buffer_t* const* command_buffer_list) {
+  iree_allocator_free(host_allocator, (void*)command_buffer_list);
+}
+
+// Copies of the given |in_list| to |out_list| to retain the semaphore and value
+// list.
 static iree_status_t iree_hal_rocm_copy_semaphore_list(
     iree_hal_semaphore_list_t in_list, iree_allocator_t host_allocator,
     iree_hal_semaphore_list_t* out_list) {
@@ -240,8 +377,8 @@ static void iree_hal_rocm_free_semaphore_list(
 }
 
 iree_status_t iree_hal_rocm_pending_queue_actions_enqueue_execution(
-    hipStream_t dispatch_stream, hipStream_t callback_stream,
-    iree_hal_rocm_pending_queue_actions_t* actions,
+    iree_hal_device_t* device, hipStream_t dispatch_stream,
+    hipStream_t callback_stream, iree_hal_rocm_pending_queue_actions_t* actions,
     const iree_hal_semaphore_list_t wait_semaphore_list,
     const iree_hal_semaphore_list_t signal_semaphore_list,
     iree_host_size_t command_buffer_count,
@@ -252,15 +389,13 @@ iree_status_t iree_hal_rocm_pending_queue_actions_enqueue_execution(
 
   iree_hal_rocm_queue_action_t* action = NULL;
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
-      z0, iree_allocator_malloc(actions->context->host_allocator, sizeof(*action),
-                                (void**)&action));
+      z0, iree_allocator_malloc(actions->context->host_allocator,
+                                sizeof(*action), (void**)&action));
 
   action->kind = IREE_HAL_ROCM_QUEUE_ACTION_TYPE_EXECUTION;
-  action->payload.command_buffers.count = command_buffer_count;
-  action->payload.command_buffers.ptr = command_buffers;
+  action->device = device;
   action->dispatch_hip_stream = dispatch_stream;
   action->callback_hip_stream = callback_stream;
-  action->events = NULL;
   action->event_count = 0;
   action->is_pending = true;
 
@@ -283,17 +418,26 @@ iree_status_t iree_hal_rocm_pending_queue_actions_enqueue_execution(
                                      signal_semaphore_list.semaphores);
   }
 
+  // Copy the command buffer list for later access.
+  // TODO: avoid host allocator malloc; use some pool for the allocation.
+  if (IREE_LIKELY(iree_status_is_ok(status))) {
+    action->payload.command_buffers.count = command_buffer_count;
+    status = iree_hal_rocm_copy_command_buffer_list(
+        command_buffer_count, command_buffers, actions->context->host_allocator,
+        &action->payload.command_buffers.ptr);
+  }
+
   // Copy the semaphore and value list for later access.
   // TODO: avoid host allocator malloc; use some pool for the allocation.
   if (IREE_LIKELY(iree_status_is_ok(status))) {
     status = iree_hal_rocm_copy_semaphore_list(wait_semaphore_list,
-                                                actions->context->host_allocator,
-                                                &action->wait_semaphore_list);
+                                               actions->context->host_allocator,
+                                               &action->wait_semaphore_list);
   }
   if (IREE_LIKELY(iree_status_is_ok(status))) {
     status = iree_hal_rocm_copy_semaphore_list(signal_semaphore_list,
-                                                actions->context->host_allocator,
-                                                &action->signal_semaphore_list);
+                                               actions->context->host_allocator,
+                                               &action->signal_semaphore_list);
   }
 
   if (IREE_LIKELY(iree_status_is_ok(status))) {
@@ -307,9 +451,11 @@ iree_status_t iree_hal_rocm_pending_queue_actions_enqueue_execution(
     iree_slim_mutex_unlock(&actions->action_mutex);
   } else {
     iree_hal_rocm_free_semaphore_list(actions->context->host_allocator,
-                                       &action->wait_semaphore_list);
+                                      &action->wait_semaphore_list);
     iree_hal_rocm_free_semaphore_list(actions->context->host_allocator,
-                                       &action->signal_semaphore_list);
+                                      &action->signal_semaphore_list);
+    iree_hal_rocm_free_command_buffer_list(actions->context->host_allocator,
+                                           action->payload.command_buffers.ptr);
     iree_hal_resource_set_free(resource_set);
     iree_allocator_free(actions->context->host_allocator, action);
   }
@@ -344,7 +490,6 @@ static void iree_hal_rocm_execution_device_signal_host_callback(
 // Issues the given kernel dispatch |action| to the GPU.
 static iree_status_t iree_hal_rocm_pending_queue_actions_issue_execution(
     iree_hal_rocm_queue_action_t* action) {
-  IREE_ASSERT(action->events != NULL);
   IREE_ASSERT(action->is_pending == false);
   iree_hal_rocm_dynamic_symbols_t* symbols =
       action->owning_actions->context->syms;
@@ -358,22 +503,41 @@ static iree_status_t iree_hal_rocm_pending_queue_actions_issue_execution(
     IREE_ROCM_RETURN_AND_END_ZONE_IF_ERROR(
         z0, symbols,
         hipStreamWaitEvent(action->dispatch_hip_stream, action->events[i],
-                          hipEventDefault),
+                           hipEventDefault),
         "hipStreamWaitEvent");
   }
 
   // Then launch all command buffers to the dispatch stream.
   for (iree_host_size_t i = 0; i < action->payload.command_buffers.count; ++i) {
-    iree_hal_command_buffer_t* command_buffer = action->payload.command_buffers.ptr[i];
+    iree_hal_command_buffer_t* command_buffer =
+        action->payload.command_buffers.ptr[i];
     if (iree_hal_rocm_graph_command_buffer_isa(command_buffer)) {
-        hipGraphExec_t exec = iree_hal_rocm_graph_command_buffer_handle(
-                command_buffer);
-        IREE_ROCM_RETURN_AND_END_ZONE_IF_ERROR(
-                z0, symbols, hipGraphLaunch(exec, action->dispatch_hip_stream),
-                "hipGraphLaunch");
+      hipGraphExec_t exec =
+          iree_hal_rocm_graph_command_buffer_handle(command_buffer);
+      IREE_ROCM_RETURN_AND_END_ZONE_IF_ERROR(
+          z0, symbols, hipGraphLaunch(exec, action->dispatch_hip_stream),
+          "hipGraphLaunch");
     } else if (iree_hal_rocm_direct_command_buffer_isa(command_buffer)) {
-      IREE_ROCM_RETURN_AND_END_ZONE_IF_ERROR(z0, action->owning_actions->context->syms,
-                           hipStreamSynchronize(0), "hipStreamSynchronize");
+      IREE_ROCM_RETURN_AND_END_ZONE_IF_ERROR(
+          z0, symbols, hipStreamSynchronize(action->dispatch_hip_stream),
+          "hipStreamSynchronize");
+    } else {
+      iree_hal_command_buffer_t* stream_command_buffer = NULL;
+      iree_hal_command_buffer_mode_t mode =
+          IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT |
+          IREE_HAL_COMMAND_BUFFER_MODE_ALLOW_INLINE_EXECUTION |
+          IREE_HAL_COMMAND_BUFFER_MODE_UNVALIDATED;
+      IREE_RETURN_AND_END_ZONE_IF_ERROR(
+          z0, iree_hal_rocm_device_create_stream_command_buffer(
+                  action->device, mode, IREE_HAL_COMMAND_CATEGORY_ANY,
+                  /*binding_capacity=*/0, &stream_command_buffer));
+      IREE_RETURN_AND_END_ZONE_IF_ERROR(
+          z0, iree_hal_resource_set_insert(action->resource_set, 1,
+                                           &stream_command_buffer));
+      IREE_RETURN_AND_END_ZONE_IF_ERROR(
+          z0, iree_hal_deferred_command_buffer_apply(
+                  command_buffer, stream_command_buffer,
+                  iree_hal_buffer_binding_table_empty()));
     }
   }
 
@@ -393,8 +557,7 @@ static iree_status_t iree_hal_rocm_pending_queue_actions_issue_execution(
     // Let the callback stream to wait on the hipEvent_t.
     IREE_ROCM_RETURN_AND_END_ZONE_IF_ERROR(
         z0, symbols,
-        hipStreamWaitEvent(action->callback_hip_stream, event,
-                          hipEventDefault),
+        hipStreamWaitEvent(action->callback_hip_stream, event, hipEventDefault),
         "hipStreamWaitEvent");
   }
 
@@ -403,8 +566,8 @@ static iree_status_t iree_hal_rocm_pending_queue_actions_issue_execution(
   IREE_ROCM_RETURN_AND_END_ZONE_IF_ERROR(
       z0, symbols,
       hipLaunchHostFunc(action->callback_hip_stream,
-                       iree_hal_rocm_execution_device_signal_host_callback,
-                       action),
+                        iree_hal_rocm_execution_device_signal_host_callback,
+                        action),
       "hipLaunchHostFunc");
 
   IREE_TRACE_ZONE_END(z0);
@@ -420,9 +583,9 @@ static void iree_hal_rocm_pending_queue_actions_cleanup_execution(
 
   iree_hal_resource_set_free(action->resource_set);
   iree_hal_rocm_free_semaphore_list(host_allocator,
-                                     &action->wait_semaphore_list);
+                                    &action->wait_semaphore_list);
   iree_hal_rocm_free_semaphore_list(host_allocator,
-                                     &action->signal_semaphore_list);
+                                    &action->signal_semaphore_list);
   iree_hal_resource_release(actions);
 
   iree_allocator_free(host_allocator, action);
@@ -455,10 +618,6 @@ iree_status_t iree_hal_rocm_pending_queue_actions_issue(
     iree_hal_semaphore_t** semaphores = action->wait_semaphore_list.semaphores;
     uint64_t* values = action->wait_semaphore_list.payload_values;
 
-    // We are allocating stack space here, assuming that there won't be a lot of
-    // waits and additional references to this field happens in a function call
-    // from this function.
-    action->events = iree_alloca(semaphore_count * sizeof(hipEvent_t));
     action->event_count = 0;
     action->is_pending = false;
 
@@ -467,26 +626,38 @@ iree_status_t iree_hal_rocm_pending_queue_actions_issue(
       // If this semaphore has already signaled past the desired value, we can
       // just ignore it.
       uint64_t value = 0;
-      IREE_RETURN_AND_END_ZONE_IF_ERROR(
-          z0, iree_hal_semaphore_query(semaphores[i], &value));
+      iree_status_t status = iree_hal_semaphore_query(semaphores[i], &value);
+      if (!iree_status_is_ok(status)) {
+        iree_slim_mutex_unlock(&actions->action_mutex);
+        IREE_TRACE_ZONE_END(z0);
+        return status;
+      }
       if (value >= values[i]) continue;
 
       // Try to acquire a hipEvent_t from a device wait timepoint. If so, we can
-      // use that hipEvent_t to wait on the device. Otherwise, this action is still
-      // not ready.
+      // use that hipEvent_t to wait on the device. Otherwise, this action is
+      // still not ready.
       hipEvent_t event = NULL;
-      IREE_RETURN_AND_END_ZONE_IF_ERROR(
-          z0, iree_hal_rocm_event_semaphore_acquire_timepoint_device_wait(
-                  semaphores[i], values[i], &event));
-      if (event) {
-        action->events[action->event_count++] = event;
-      } else {
+      status = iree_hal_rocm_event_semaphore_acquire_timepoint_device_wait(
+          semaphores[i], values[i], &event);
+      if (!iree_status_is_ok(status)) {
+        iree_slim_mutex_unlock(&actions->action_mutex);
+        IREE_TRACE_ZONE_END(z0);
+        return status;
+      }
+      if (!event) {
         // Clear the scratch fields.
-        action->events = NULL;
         action->event_count = 0;
         action->is_pending = true;
         break;
       }
+      if (action->event_count >= IREE_HAL_ROCM_MAX_WAIT_EVENT_COUNT) {
+        iree_slim_mutex_unlock(&actions->action_mutex);
+        IREE_TRACE_ZONE_END(z0);
+        return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                                "exceeded max wait CUevent limit");
+      }
+      action->events[action->event_count++] = event;
     }
 
     if (action->is_pending) {
@@ -503,20 +674,108 @@ iree_status_t iree_hal_rocm_pending_queue_actions_issue(
 
   iree_slim_mutex_unlock(&actions->action_mutex);
 
-  // Now go through the ready list and issue the actions to the GPU.
-  for (iree_hal_rocm_queue_action_t* action = ready_list.head;
-       action != NULL;) {
-    iree_hal_rocm_queue_action_t* next_action = action->next;
-    action->next = NULL;
+   iree_hal_rocm_atomic_slist_entry_t* entry = NULL;
+  // TODO: avoid host allocator malloc; use some pool for the allocation.
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, iree_allocator_malloc(actions->context->host_allocator, sizeof(*entry),
+                                (void**)&entry));
+  entry->ready_list_head = ready_list.head;
 
-    IREE_RETURN_AND_END_ZONE_IF_ERROR(
-        z0, iree_hal_rocm_pending_queue_actions_issue_execution(action));
-    action->events = NULL;
-    action->event_count = 0;
-
-    action = next_action;
-  }
+  // Now push the ready list to the worker and have it to issue the actions to
+  // the GPU.
+  iree_hal_rocm_working_area_t* working_area = &actions->working_area;
+  iree_hal_rocm_ready_action_slist_push(&working_area->ready_worklist, entry);
+  iree_atomic_store_int32(&working_area->working_state,
+                          IREE_HAL_ROCM_WORKER_STATE_WORKLOAD_PENDING,
+                          iree_memory_order_relaxed);
+  iree_notification_post(&working_area->notification, IREE_ALL_WAITERS);
 
   IREE_TRACE_ZONE_END(z0);
   return iree_ok_status();
+}
+
+//===----------------------------------------------------------------------===//
+// Worker routines
+//===----------------------------------------------------------------------===//
+
+static bool iree_hal_rocm_worker_has_incoming_request(void* args) {
+  iree_hal_rocm_working_area_t* working_area =
+      (iree_hal_rocm_working_area_t*)args;
+  int value = iree_atomic_load_int32(&working_area->working_state,
+                                     iree_memory_order_relaxed);
+  if (value == IREE_HAL_ROCM_WORKER_STATE_WORKLOAD_PENDING) return true;
+  return iree_atomic_load_int32(&working_area->exiting_state,
+                                iree_memory_order_relaxed) ==
+         IREE_HAL_ROCM_WORKER_STATE_EXIT_REQUESTED;
+}
+
+// Processes all ready actions in the given |worklist|.
+static int iree_hal_rocm_worker_process_ready_list(
+    iree_allocator_t host_allocator,
+    iree_hal_rocm_ready_action_slist_t* worklist) {
+  iree_hal_rocm_atomic_slist_entry_t* entry =
+      iree_hal_rocm_ready_action_slist_pop(worklist);
+  while (entry) {
+    // Process the current batch of ready actions.
+    for (iree_hal_rocm_queue_action_t* action = entry->ready_list_head;
+         action != NULL;) {
+      iree_hal_rocm_queue_action_t* next_action = action->next;
+      action->next = NULL;
+
+      iree_status_t status =
+          iree_hal_rocm_pending_queue_actions_issue_execution(action);
+      if (!iree_status_is_ok(status)) {
+        // TODO: surface better error back from this thread.
+        iree_status_ignore(status);
+        return 1;
+      }
+      action->event_count = 0;
+
+      action = next_action;
+    }
+
+    iree_allocator_free(host_allocator, entry);
+    // Try to see if we have the next batch.
+    entry = iree_hal_rocm_ready_action_slist_pop(worklist);
+  }
+  return 0;
+}
+
+// The main function for the ready-list processing worker thread.
+static int iree_hal_rocm_worker_execute(void* args) {
+  iree_hal_rocm_working_area_t* working_area =
+      (iree_hal_rocm_working_area_t*)args;
+
+  iree_hal_rocm_ready_action_slist_t* worklist = &working_area->ready_worklist;
+  iree_atomic_int32_t* exiting_state = &working_area->exiting_state;
+
+  while (true) {
+    // Block waiting for incoming requests.
+    iree_notification_await(&working_area->notification,
+                            iree_hal_rocm_worker_has_incoming_request, args,
+                            iree_infinite_timeout());
+
+    // Check if we received request to stop processing and exit this thread.
+    bool should_exit =
+        iree_atomic_load_int32(exiting_state, iree_memory_order_relaxed) ==
+        IREE_HAL_ROCM_WORKER_STATE_EXIT_REQUESTED;
+
+    int return_value = iree_hal_rocm_worker_process_ready_list(
+        working_area->host_allocator, worklist);
+    if (return_value != 0) return return_value;
+
+    if (should_exit) {
+      // Signal that this thread is committed to exit.
+      iree_atomic_store_int32(exiting_state,
+                              IREE_HAL_ROCM_WORKER_STATE_EXIT_COMMITTED,
+                              iree_memory_order_relaxed);
+      return return_value;
+    }
+
+    // Signal that this thread is done processing and now waiting for more.
+    iree_atomic_store_int32(&working_area->working_state,
+                            IREE_HAL_ROCM_WORKER_STATE_IDLE_WAITING,
+                            iree_memory_order_relaxed);
+  }
+  return 0;
 }

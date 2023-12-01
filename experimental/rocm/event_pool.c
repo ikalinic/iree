@@ -35,11 +35,11 @@ struct iree_hal_rocm_event_t {
   // make sure the event outlive the pool.
   iree_hal_rocm_event_pool_t* pool;
   // The underlying hipEvent_t object.
-  hipEvent_t cu_event;
+  hipEvent_t hip_event;
 };
 
 hipEvent_t iree_hal_rocm_event_handle(const iree_hal_rocm_event_t* event) {
-  return event->cu_event;
+  return event->hip_event;
 }
 
 static inline void iree_hal_rocm_event_destroy(iree_hal_rocm_event_t* event) {
@@ -48,16 +48,15 @@ static inline void iree_hal_rocm_event_destroy(iree_hal_rocm_event_t* event) {
   IREE_TRACE_ZONE_BEGIN(z0);
 
   IREE_ASSERT_REF_COUNT_ZERO(&event->ref_count);
-  ROCM_IGNORE_ERROR(symbols, hipEventDestroy(event->cu_event));
+  ROCM_IGNORE_ERROR(symbols, hipEventDestroy(event->hip_event));
   iree_allocator_free(host_allocator, event);
 
   IREE_TRACE_ZONE_END(z0);
 }
 
 static inline iree_status_t iree_hal_rocm_event_create(
-    iree_hal_rocm_dynamic_symbols_t* symbols,
-    iree_hal_rocm_event_pool_t* pool, iree_allocator_t host_allocator,
-    iree_hal_rocm_event_t** out_event) {
+    iree_hal_rocm_dynamic_symbols_t* symbols, iree_hal_rocm_event_pool_t* pool,
+    iree_allocator_t host_allocator, iree_hal_rocm_event_t** out_event) {
   IREE_ASSERT_ARGUMENT(symbols);
   IREE_ASSERT_ARGUMENT(pool);
   IREE_ASSERT_ARGUMENT(out_event);
@@ -72,10 +71,10 @@ static inline iree_status_t iree_hal_rocm_event_create(
   event->host_allocator = host_allocator;
   event->symbols = symbols;
   event->pool = pool;
-  event->cu_event = NULL;
+  event->hip_event = NULL;
 
   iree_status_t status = ROCM_RESULT_TO_STATUS(
-      symbols, hipEventCreateWithFlags(&event->cu_event, hipEventDisableTiming),
+      symbols, hipEventCreateWithFlags(&event->hip_event, hipEventDisableTiming),
       "hipEventCreateWithFlags");
   if (iree_status_is_ok(status)) {
     *out_event = event;
@@ -144,8 +143,7 @@ static void iree_hal_rocm_event_pool_free(
     iree_hal_rocm_event_pool_t* event_pool);
 
 iree_status_t iree_hal_rocm_event_pool_allocate(
-    iree_hal_device_t* owning_device,
-    iree_hal_rocm_dynamic_symbols_t* symbols,
+    iree_hal_device_t* owning_device, iree_hal_rocm_dynamic_symbols_t* symbols,
     iree_host_size_t available_capacity, iree_allocator_t host_allocator,
     iree_hal_rocm_event_pool_t** out_event_pool) {
   IREE_ASSERT_ARGUMENT(symbols);
@@ -211,8 +209,7 @@ void iree_hal_rocm_event_pool_retain(iree_hal_rocm_event_pool_t* event_pool) {
   iree_atomic_ref_count_inc(&event_pool->ref_count);
 }
 
-void iree_hal_rocm_event_pool_release(
-    iree_hal_rocm_event_pool_t* event_pool) {
+void iree_hal_rocm_event_pool_release(iree_hal_rocm_event_pool_t* event_pool) {
   if (iree_atomic_ref_count_dec(&event_pool->ref_count) == 1) {
     iree_hal_rocm_event_pool_free(event_pool);
   }
@@ -250,12 +247,12 @@ iree_status_t iree_hal_rocm_event_pool_acquire(
     iree_status_t status = iree_ok_status();
     for (iree_host_size_t i = 0; i < remaining_count; ++i) {
       status = iree_hal_rocm_event_create(event_pool->symbols, event_pool,
-                                           event_pool->host_allocator,
-                                           &out_events[from_pool_count + i]);
+                                          event_pool->host_allocator,
+                                          &out_events[from_pool_count + i]);
       if (!iree_status_is_ok(status)) {
         // Must release all events we've acquired so far.
         iree_hal_rocm_event_pool_release_event(event_pool, from_pool_count + i,
-                                                out_events);
+                                               out_events);
         IREE_TRACE_ZONE_END(z1);
         IREE_TRACE_ZONE_END(z0);
         return status;
