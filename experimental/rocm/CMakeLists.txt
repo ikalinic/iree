@@ -69,6 +69,8 @@ iree_cc_library(
     "pipeline_layout.h"
     "status_util.c"
     "status_util.h"
+    "stream_command_buffer.c"
+    "stream_command_buffer.h"
     "timepoint_pool.c"
     "timepoint_pool.h"
     "tracing.c"
@@ -85,9 +87,11 @@ iree_cc_library(
     iree::base::internal::event_pool
     iree::base::internal::flatcc::parsing
     iree::base::internal::synchronization
+    iree::base::internal::threading
     iree::hal
     iree::hal::utils::buffer_transfer
     iree::hal::utils::collective_batch
+    iree::hal::utils::deferred_command_buffer
     iree::hal::utils::file_transfer
     iree::hal::utils::memory_file
     iree::hal::utils::resource_set
