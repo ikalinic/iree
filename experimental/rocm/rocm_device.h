@@ -25,6 +25,13 @@ iree_status_t iree_hal_rocm_device_create(iree_hal_driver_t* driver,
                                           iree_allocator_t host_allocator,
                                           iree_hal_device_t** out_device);
 
+// Creates a ROCM stream-backed command buffer using resources from the the
+// given |base_device|.
+iree_status_t iree_hal_rocm_device_create_stream_command_buffer(
+    iree_hal_device_t* base_device, iree_hal_command_buffer_mode_t mode,
+    iree_hal_command_category_t command_categories,
+    iree_host_size_t binding_capacity,
+    iree_hal_command_buffer_t** out_command_buffer);
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
