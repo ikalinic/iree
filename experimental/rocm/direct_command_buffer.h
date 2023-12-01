@@ -40,6 +40,7 @@ iree_status_t iree_hal_rocm_direct_command_buffer_create(
     iree_hal_command_category_t command_categories,
     iree_hal_queue_affinity_t queue_affinity, iree_host_size_t binding_capacity,
     iree_arena_block_pool_t* block_pool,
+    hipStream_t hip_stream,
     iree_hal_command_buffer_t** out_command_buffer);
 
 // Returns true if |command_buffer| is a ROCM command buffer.

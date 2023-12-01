@@ -29,6 +29,8 @@ typedef struct {
   iree_hal_rocm_context_wrapper_t* context;
   iree_arena_block_pool_t* block_pool;
   iree_hal_rocm_tracing_context_t* tracing_context;
+  
+  hipStream_t hip_stream;
 
   // Keep track of the current set of kernel arguments.
   int32_t push_constant[IREE_HAL_ROCM_MAX_PUSH_CONSTANT_COUNT];
@@ -56,6 +58,7 @@ iree_status_t iree_hal_rocm_direct_command_buffer_create(
     iree_hal_command_category_t command_categories,
     iree_hal_queue_affinity_t queue_affinity, iree_host_size_t binding_capacity,
     iree_arena_block_pool_t* block_pool,
+    hipStream_t hip_stream,
     iree_hal_command_buffer_t** out_command_buffer) {
   IREE_ASSERT_ARGUMENT(context);
   IREE_ASSERT_ARGUMENT(block_pool);
@@ -82,6 +85,7 @@ iree_status_t iree_hal_rocm_direct_command_buffer_create(
     command_buffer->context = context;
     command_buffer->tracing_context = tracing_context;
     command_buffer->block_pool = block_pool;
+    command_buffer->hip_stream = hip_stream;
     hipDeviceptr_t* device_ptrs =
         (hipDeviceptr_t*)(command_buffer->current_descriptor +
                           IREE_HAL_ROCM_MAX_KERNEL_ARG);
@@ -253,7 +257,7 @@ static iree_status_t iree_hal_rocm_direct_command_buffer_update_buffer(
 
   ROCM_RETURN_IF_ERROR(
       command_buffer->context->syms,
-      hipMemcpyHtoDAsync(dst, (void*)src, length, 0),
+      hipMemcpyHtoDAsync(dst, (void*)src, length, command_buffer->hip_stream),
       "hipMemcpyAsync");
 
   return iree_ok_status();
@@ -281,7 +285,7 @@ static iree_status_t iree_hal_rocm_direct_command_buffer_copy_buffer(
   // access proper stream from command buffer
   ROCM_RETURN_IF_ERROR(
       command_buffer->context->syms,
-      hipMemcpyAsync(dst, src, length, hipMemcpyDeviceToDevice, 0),
+      hipMemcpyAsync(dst, src, length, hipMemcpyDeviceToDevice, command_buffer->hip_stream),
       "hipMemcpyAsync");
   return iree_ok_status();
 }
