@@ -54,6 +54,10 @@ typedef struct iree_hal_rocm_memory_pooling_params_t {
 // Parameters configuring an iree_hal_rocm_device_t.
 // Must be initialized with iree_hal_rocm_device_params_initialize prior to use.
 typedef struct iree_hal_rocm_device_params_t {
+  // Number of queues exposed on the device.
+  // Each queue acts as a separate synchronization scope where all work executes
+  // concurrently unless prohibited by semaphores.
+  iree_host_size_t queue_count;
 
   // Total size of each block in the device shared block pool.
   // Larger sizes will lower overhead and ensure the heap isn't hit for
