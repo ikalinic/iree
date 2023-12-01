@@ -57,6 +57,7 @@ RC_PFN_DECL(hipModuleLoadDataEx, hipModule_t *, const void *, unsigned int,
             hipJitOption *, void **)
 RC_PFN_DECL(hipModuleLoadData, hipModule_t *, const void *)
 RC_PFN_DECL(hipModuleUnload, hipModule_t)
+RC_PFN_DECL(hipStreamCreate, hipStream_t *)
 RC_PFN_DECL(hipStreamCreateWithFlags, hipStream_t *, unsigned int)
 RC_PFN_DECL(hipStreamDestroy, hipStream_t)
 RC_PFN_DECL(hipStreamSynchronize, hipStream_t)
