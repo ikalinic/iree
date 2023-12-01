@@ -6,6 +6,7 @@
 
 #include "experimental/rocm/rocm_device.h"
 
+#include <iree/base/alignment.h>
 #include <iree/base/status.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -25,6 +26,7 @@
 #include "experimental/rocm/rocm_allocator.h"
 #include "experimental/rocm/rocm_event.h"
 #include "experimental/rocm/status_util.h"
+#include "experimental/rocm/stream_command_buffer.h"
 #include "experimental/rocm/tracing.h"
 #include "hip/hip_runtime_api.h"
 #include "iree/base/internal/arena.h"
@@ -81,10 +83,6 @@ typedef struct iree_hal_rocm_device_t {
 
   // Optional provider used for creating/configuring collective channels.
   iree_hal_channel_provider_t* channel_provider;
-
-  // Cache of the direct stream command buffer initialized when in stream mode.
-  // TODO: have one cached per stream once there are multiple streams.
-  iree_hal_command_buffer_t* stream_command_buffer;
 } iree_hal_rocm_device_t;
 
 static const iree_hal_device_vtable_t iree_hal_rocm_device_vtable;
@@ -101,10 +99,23 @@ IREE_API_EXPORT void iree_hal_rocm_device_params_initialize(
   out_params->arena_block_size = 32 * 1024;
   out_params->event_pool_capacity = 32;
   out_params->command_buffer_mode = IREE_HAL_ROCM_COMMAND_BUFFER_MODE_GRAPH;
+  out_params->queue_count = 1;
   out_params->stream_tracing = false;
   out_params->async_allocations = true;
 }
 
+static iree_status_t iree_hal_rocm_device_check_params(
+    const iree_hal_rocm_device_params_t* params) {
+  if (params->arena_block_size < 4096) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "arena block size too small (< 4096 bytes)");
+  }
+  if (params->queue_count == 0) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "at least one queue is required");
+  }
+  return iree_ok_status();
+}
 static void iree_hal_rocm_device_destroy(iree_hal_device_t* base_device) {
   iree_hal_rocm_device_t* device = iree_hal_rocm_device_cast(base_device);
   iree_allocator_t host_allocator = iree_hal_device_host_allocator(base_device);
@@ -114,18 +125,17 @@ static void iree_hal_rocm_device_destroy(iree_hal_device_t* base_device) {
   iree_hal_rocm_pending_queue_actions_destroy(
       (iree_hal_resource_t*)device->pending_queue_actions);
 
-  iree_hal_command_buffer_release(device->stream_command_buffer);
-
   // There should be no more buffers live that use the allocator.
   iree_hal_allocator_release(device->device_allocator);
-
-  // Destroy memory pools that hold on to reserved memory.
-  iree_hal_rocm_memory_pools_deinitialize(&device->memory_pools);
 
   // Buffers may have been retaining collective resources.
   iree_hal_channel_provider_release(device->channel_provider);
 
+  // Destroy memory pools that hold on to reserved memory.
+  iree_hal_rocm_memory_pools_deinitialize(&device->memory_pools);
+
   iree_hal_rocm_tracing_context_free(device->tracing_context);
+
   // Destroy various pools for synchronization.
   if (device->timepoint_pool) {
     iree_hal_rocm_timepoint_pool_free(device->timepoint_pool);
@@ -139,6 +149,10 @@ static void iree_hal_rocm_device_destroy(iree_hal_device_t* base_device) {
                     hipStreamDestroy(device->dispatch_hip_stream));
   ROCM_IGNORE_ERROR(device->context_wrapper.syms,
                     hipStreamDestroy(device->callback_hip_stream));
+
+  ROCM_IGNORE_ERROR(
+      device->context_wrapper.syms,
+      hipDevicePrimaryCtxRelease(device->context_wrapper.rocm_device));
 
   iree_arena_block_pool_deinitialize(&device->block_pool);
 
@@ -157,11 +171,13 @@ static iree_status_t iree_hal_rocm_device_create_internal(
     iree_hal_rocm_dynamic_symbols_t* syms, iree_allocator_t host_allocator,
     iree_hal_device_t** out_device) {
   iree_hal_rocm_device_t* device = NULL;
-  iree_host_size_t total_size = sizeof(*device) + identifier.size;
+  iree_host_size_t total_size = iree_sizeof_struct(*device) + identifier.size;
   IREE_RETURN_IF_ERROR(
       iree_allocator_malloc(host_allocator, total_size, (void**)&device));
   memset(device, 0, total_size);
   iree_hal_resource_initialize(&iree_hal_rocm_device_vtable, &device->resource);
+  iree_arena_block_pool_initialize(params->arena_block_size, host_allocator,
+                                   &device->block_pool);
   device->driver = driver;
   iree_hal_driver_retain(device->driver);
   uint8_t* buffer_ptr = (uint8_t*)device + sizeof(*device);
@@ -175,9 +191,6 @@ static iree_status_t iree_hal_rocm_device_create_internal(
   device->context_wrapper.rocm_device = rocm_device;
   device->context_wrapper.host_allocator = host_allocator;
   device->context_wrapper.syms = syms;
-
-  iree_arena_block_pool_initialize(params->arena_block_size, host_allocator,
-                                   &device->block_pool);
 
   iree_status_t status = iree_hal_rocm_pending_queue_actions_create(
       &device->context_wrapper, &device->block_pool,
@@ -200,6 +213,8 @@ static iree_status_t iree_hal_rocm_device_create_internal(
         "hipDeviceGetAttribute");
     device->supports_memory_pools = supports_memory_pools != 0;
   }
+
+  // Create memory pools first so that we can share them with the allocator.
   if (iree_status_is_ok(status)) {
     status = iree_hal_rocm_memory_pools_initialize(
         &device->context_wrapper, &params->memory_pools, &device->memory_pools);
@@ -208,8 +223,10 @@ static iree_status_t iree_hal_rocm_device_create_internal(
   if (iree_status_is_ok(status)) {
     status = iree_hal_rocm_allocator_create(
         &device->context_wrapper, device->device, dispatch_stream,
-        &device->memory_pools, &device->device_allocator);
+        device->supports_memory_pools ? &device->memory_pools : NULL,
+        &device->device_allocator);
   }
+
   if (iree_status_is_ok(status)) {
     *out_device = (iree_hal_device_t*)device;
   } else {
@@ -223,25 +240,35 @@ iree_status_t iree_hal_rocm_device_create(
     const iree_hal_rocm_device_params_t* params,
     iree_hal_rocm_dynamic_symbols_t* syms, hipDevice_t device,
     iree_allocator_t host_allocator, iree_hal_device_t** out_device) {
+  IREE_ASSERT_ARGUMENT(driver);
   IREE_ASSERT_ARGUMENT(params);
+  IREE_ASSERT_ARGUMENT(out_device);
   IREE_TRACE_ZONE_BEGIN(z0);
-  hipCtx_t context;
-  IREE_RETURN_AND_END_ZONE_IF_ERROR(
-      z0,
-      ROCM_RESULT_TO_STATUS(syms, hipDevicePrimaryCtxRetain(&context, device)));
-  IREE_RETURN_AND_END_ZONE_IF_ERROR(
-      z0, ROCM_RESULT_TO_STATUS(syms, hipCtxSetCurrent(context)));
 
-  hipStream_t dispatch_stream;
-  iree_status_t status = ROCM_RESULT_TO_STATUS(
-      syms, hipStreamCreateWithFlags(&dispatch_stream, hipStreamNonBlocking));
+  iree_status_t status = iree_hal_rocm_device_check_params(params);
 
+  // Get the main context for the device.
+  hipCtx_t context = NULL;
+  if (iree_status_is_ok(status)) {
+      status = ROCM_RESULT_TO_STATUS(syms, hipDevicePrimaryCtxRetain(&context, device));
+  }
+  if (iree_status_is_ok(status)) {
+    status = ROCM_RESULT_TO_STATUS(syms, hipCtxSetCurrent(context));
+  }
+
+  // Create the default dispatch stream for the device.
+  hipStream_t dispatch_stream = NULL;
+  if (iree_status_is_ok(status)) {
+      status = ROCM_RESULT_TO_STATUS(
+              syms, hipStreamCreateWithFlags(&dispatch_stream, hipStreamNonBlocking));
+  }
   // Create the default callback stream for the device.
-  hipStream_t callback_stream;
+  hipStream_t callback_stream = NULL;
   if (iree_status_is_ok(status)) {
     status = ROCM_RESULT_TO_STATUS(
         syms, hipStreamCreateWithFlags(&callback_stream, hipStreamNonBlocking));
   }
+
   if (iree_status_is_ok(status)) {
     status = iree_hal_rocm_device_create_internal(
         driver, identifier, params, device, dispatch_stream, callback_stream,
@@ -262,7 +289,8 @@ iree_status_t iree_hal_rocm_device_create(
   iree_hal_rocm_event_pool_t* device_event_pool = NULL;
   if (iree_status_is_ok(status)) {
     status = iree_hal_rocm_event_pool_allocate(
-        *out_device, syms, params->event_pool_capacity, host_allocator, &device_event_pool);
+        *out_device, syms, params->event_pool_capacity, host_allocator,
+        &device_event_pool);
   }
 
   iree_hal_rocm_timepoint_pool_t* timepoint_pool = NULL;
@@ -273,7 +301,7 @@ iree_status_t iree_hal_rocm_device_create(
   }
 
   if (iree_status_is_ok(status)) {
-       iree_hal_rocm_device_t* cuda_device =
+    iree_hal_rocm_device_t* cuda_device =
         iree_hal_rocm_device_cast(*out_device);
     cuda_device->host_event_pool = host_event_pool;
     cuda_device->device_event_pool = device_event_pool;
@@ -358,6 +386,18 @@ static iree_status_t iree_hal_rocm_device_create_channel(
                           "collectives not implemented");
 }
 
+iree_status_t iree_hal_rocm_device_create_stream_command_buffer(
+    iree_hal_device_t* base_device, iree_hal_command_buffer_mode_t mode,
+    iree_hal_command_category_t command_categories,
+    iree_host_size_t binding_capacity,
+    iree_hal_command_buffer_t** out_command_buffer) {
+  iree_hal_rocm_device_t* device = iree_hal_rocm_device_cast(base_device);
+  return iree_hal_rocm_stream_command_buffer_create(
+      base_device, &device->context_wrapper, device->tracing_context, mode,
+      command_categories, binding_capacity, device->dispatch_hip_stream,
+      &device->block_pool, out_command_buffer);
+}
+
 static iree_status_t iree_hal_rocm_device_create_command_buffer(
     iree_hal_device_t* base_device, iree_hal_command_buffer_mode_t mode,
     iree_hal_command_category_t command_categories,
@@ -369,11 +409,16 @@ static iree_status_t iree_hal_rocm_device_create_command_buffer(
       return iree_hal_rocm_direct_command_buffer_create(
           base_device, &device->context_wrapper, device->tracing_context, mode,
           command_categories, queue_affinity, binding_capacity,
-          &device->block_pool, out_command_buffer);
+          &device->block_pool, device->dispatch_hip_stream, out_command_buffer);
     case IREE_HAL_ROCM_COMMAND_BUFFER_MODE_GRAPH:
       return iree_hal_rocm_graph_command_buffer_create(
           base_device, &device->context_wrapper, mode, command_categories,
           queue_affinity, binding_capacity, &device->block_pool,
+          out_command_buffer);
+    case IREE_HAL_ROCM_COMMAND_BUFFER_MODE_STREAM:
+      return iree_hal_deferred_command_buffer_create(
+          base_device, mode, command_categories, binding_capacity,
+          &device->block_pool, iree_hal_device_host_allocator(base_device),
           out_command_buffer);
     default:
       return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
@@ -461,7 +506,7 @@ static iree_status_t iree_hal_rocm_device_queue_alloca(
   iree_hal_rocm_device_t* device = iree_hal_rocm_device_cast(base_device);
 
   // NOTE: block on the semaphores here; we could avoid this by properly
-  // sequencing device work with semaphores. The CUDA HAL is not currently
+  // sequencing device work with semaphores. The ROCM HAL is not currently
   // asynchronous.
   IREE_RETURN_IF_ERROR(iree_hal_semaphore_list_wait(wait_semaphore_list,
                                                     iree_infinite_timeout()));
@@ -496,10 +541,33 @@ static iree_status_t iree_hal_rocm_device_queue_dealloca(
     const iree_hal_semaphore_list_t wait_semaphore_list,
     const iree_hal_semaphore_list_t signal_semaphore_list,
     iree_hal_buffer_t* buffer) {
+  iree_hal_rocm_device_t* device = iree_hal_rocm_device_cast(base_device);
   // TODO: queue-ordered allocations.
-  IREE_RETURN_IF_ERROR(iree_hal_device_queue_barrier(
-      base_device, queue_affinity, wait_semaphore_list, signal_semaphore_list));
-  return iree_ok_status();
+  // IREE_RETURN_IF_ERROR(iree_hal_device_queue_barrier(
+  //     base_device, queue_affinity, wait_semaphore_list,
+  //     signal_semaphore_list));
+
+  // NOTE: block on the semaphores here; we could avoid this by properly
+  // sequencing device work with semaphores. The CUDA HAL is not currently
+  // asynchronous.
+  IREE_RETURN_IF_ERROR(iree_hal_semaphore_list_wait(wait_semaphore_list,
+                                                    iree_infinite_timeout()));
+
+  // Schedule the buffer deallocation if we got it from a pool and otherwise
+  // drop it on the floor and let it be freed when the buffer is released.
+  iree_status_t status = iree_ok_status();
+  if (device->supports_memory_pools) {
+    status = iree_hal_rocm_memory_pools_dealloca(
+        &device->memory_pools, device->dispatch_hip_stream, buffer);
+  }
+
+  // Only signal if not returning a synchronous error - synchronous failure
+  // indicates that the stream is unchanged (it's not really since we waited
+  // above, but we at least won't deadlock like this).
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_semaphore_list_signal(signal_semaphore_list);
+  }
+  return status;
 }
 
 static iree_status_t iree_hal_rocm_device_queue_read(
@@ -551,15 +619,10 @@ static iree_status_t iree_hal_rocm_device_queue_execute(
     iree_host_size_t command_buffer_count,
     iree_hal_command_buffer_t* const* command_buffers) {
   iree_hal_rocm_device_t* device = iree_hal_rocm_device_cast(base_device);
-  // TODO(raikonenfnu): Once semaphore is implemented wait for semaphores
-  // TODO(thomasraoux): implement semaphores - for now this conservatively
-  // synchronizes after every submit.
-  // stream work with device->stream, we'll change
-  // TODO(raikonenfnu): currently run on default/null stream, when cmd buffer
   IREE_TRACE_ZONE_BEGIN(z0);
 
   iree_status_t status = iree_hal_rocm_pending_queue_actions_enqueue_execution(
-      device->dispatch_hip_stream, device->callback_hip_stream,
+      base_device, device->dispatch_hip_stream, device->callback_hip_stream,
       device->pending_queue_actions, wait_semaphore_list, signal_semaphore_list,
       command_buffer_count, command_buffers);
   if (iree_status_is_ok(status)) {
@@ -567,6 +630,7 @@ static iree_status_t iree_hal_rocm_device_queue_execute(
     status = iree_hal_rocm_pending_queue_actions_issue(
         device->pending_queue_actions);
   }
+
   iree_hal_rocm_tracing_context_collect(device->tracing_context);
   IREE_TRACE_ZONE_END(z0);
   return status;
@@ -594,6 +658,7 @@ static iree_status_t iree_hal_rocm_device_profiling_begin(
     iree_hal_device_t* base_device,
     const iree_hal_device_profiling_options_t* options) {
   // Unimplemented (and that's ok).
+  // We could hook in to CUPTI here or use the much simpler cuProfilerStart API.
   return iree_ok_status();
 }
 
