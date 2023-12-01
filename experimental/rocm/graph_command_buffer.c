@@ -136,7 +136,7 @@ static void iree_hal_rocm_graph_command_buffer_destroy(
     command_buffer->hip_graph = NULL;
   }
   if (command_buffer->hip_graph_exec != NULL) {
-    ROCM_IGNORE_ERROR(command_buffer->context->syms,
+        ROCM_IGNORE_ERROR(command_buffer->context->syms,
                       hipGraphExecDestroy(command_buffer->hip_graph_exec));
     command_buffer->hip_graph_exec = NULL;
   }
@@ -255,7 +255,7 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_end(
 
   iree_hal_resource_set_freeze(command_buffer->resource_set);
 
-  return iree_ok_status();
+  return status;
 }
 
 static void iree_hal_rocm_graph_command_buffer_begin_debug_group(
@@ -398,7 +398,6 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_fill_buffer(
     return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
                             "exceeded max concurrent node limit");
   }
-
   size_t dependency_count = command_buffer->hip_barrier_node ? 1 : 0;
   ROCM_RETURN_IF_ERROR(
       command_buffer->context->syms,
@@ -636,6 +635,7 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_dispatch(
   iree_host_size_t set_count =
       iree_hal_rocm_pipeline_layout_descriptor_set_count(kernel_params.layout);
   for (iree_host_size_t i = 0; i < set_count; ++i) {
+    // TODO: cache this information in the kernel info to avoid recomputation.
     iree_host_size_t binding_count =
         iree_hal_rocm_descriptor_set_layout_binding_count(
             iree_hal_rocm_pipeline_layout_descriptor_set_layout(
@@ -650,6 +650,10 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_dispatch(
   iree_host_size_t base_index =
       iree_hal_rocm_push_constant_index(kernel_params.layout);
   for (iree_host_size_t i = 0; i < push_constant_count; i++) {
+    // As commented in the above, what each kernel parameter points to is a
+    // hipDeviceptr_t, which as the size of a pointer on the target machine. we
+    // are just storing a 32-bit value for the push constant here instead. So we
+    // must process one element each type, for 64-bit machines.
     *((uint32_t*)params_ptr[base_index + i]) =
         command_buffer->push_constants[i];
   }
@@ -677,7 +681,6 @@ static iree_status_t iree_hal_rocm_graph_command_buffer_dispatch(
     return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
                             "exceeded max concurrent node limit");
   }
-
   size_t dependency_count = command_buffer->hip_barrier_node ? 1 : 0;
   ROCM_RETURN_IF_ERROR(
       command_buffer->context->syms,
